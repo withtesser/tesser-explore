@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""tesser deterministic grounding fetcher (grounding-design.md, 2026-06-17).
+
+The "push it DOWN" half of the design: the docs/source acquisition that used to
+be brittle prose in subagent-brief.md §1-§9 (misread as a foreground checklist,
+leaked internal vocab) lives here as a deterministic binary instead. Same URL ->
+same bytes. The agent calls this and NEVER reasons about cache / cold / warm /
+pin / ls-remote -- a script owns all of it, opaquely.
+
+Two levels on one progressively-materialized clone:
+
+  fetch docs   <url>   treeless+sparse clone, materialize README + docs/   (docs grade)
+  fetch source <url>   widen the SAME clone to the full working tree        (inspect grade)
+
+Plus two local reads that do NOT touch the network:
+
+  fetch resolve <name|url>   name->identity index lookup; prints the identity +
+                             canonical URL (and known digests) for a bare-name
+                             re-ask, or status=unknown so the caller searches.
+  fetch consult <name|url>   serve the cached claim for the identity: the foreground
+                             CITATION-STRIPPED view (claim text + grade tag, never
+                             ⟦⟧@sha markup), or, with --background, the full cited
+                             digest. status=miss (exit 0) when there is none to serve.
+
+A successful docs/source fetch records its identity + canonical URL + name aliases
+into that index (under <root>/identity-index.json), so "the same unknown dep asked
+twice" resolves the second time from a bare name without re-searching. Pass
+`--alias <name>` (repeatable) to also record the package/import name the developer
+typed, for the common case where it differs from the repo basename (e.g. the npm
+name "lru-cache" for the repo "node-lru-cache").
+
+Both fetch levels print one JSON object to stdout describing what was materialized
+and the
+pin (the clone's rev-parse HEAD -- offline, never chasing upstream, D11). The
+clone is keyed by normalized identity and reused across calls, so `source` after
+`docs` widens in place at the same pin. Caching, reuse, and the warm/cold
+distinction are entirely internal: the agent reads `root` + `files` to form
+claims and `sha` for provenance; `from_cache` is informational and ignored.
+
+Verification is implicit (the design's "never block on certainty"): a bad or
+private URL makes `git clone` fail, which this reports as status=unreachable
+(NOT a crash, and NOT "doesn't exist" -- a 404 is ambiguous, D47 overclaim rule).
+
+State root: ~/.tesser/ (clones under <root>/clones/<identity>/). TESSER_HOME
+overrides the root for hermetic tests ONLY; real invocations never set it.
+
+Exit codes:
+  0  ok                  (status=ok JSON on stdout)
+  2  usage error         (bad arguments)
+  4  environment failure (git not on PATH)
+  5  unreachable         (status=unreachable JSON on stdout; clone/verify failed)
+
+The run step (build / exercise / interpret + the verification-contract) is NOT
+here -- it is a background sub-agent, because it needs judgment. This script is
+acquisition only.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# Docs-level sparse-checkout set. Cone mode always materializes root-level files
+# (so README.md / README is present after a --sparse clone); we add the prose
+# docs directories on top. Kept deliberately small -- this is the fast beat-1
+# fetch, not a full tree.
+DOCS_DIRS = ("docs", "doc")
+# Files we surface as the materialized "docs" so the agent knows what to read.
+# Root-level docs are matched case-insensitively against these stems.
+DOCS_ROOT_STEMS = ("readme", "changelog", "contributing", "license", "usage")
+GIT_TIMEOUT_SECONDS = 120
+
+
+def state_root() -> str:
+    """Resolve the state root: TESSER_HOME (tests only) or ~/.tesser/."""
+    override = os.environ.get("TESSER_HOME")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".tesser")
+
+
+def fail_usage(message: str) -> "None":
+    print(f"fetch: error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def fail_env(message: str) -> "None":
+    print(f"fetch: environment: {message}", file=sys.stderr)
+    sys.exit(4)
+
+
+def emit_unreachable(url: str, identity, detail: str) -> "None":
+    """Print the unreachable JSON and exit 5. A failed clone is a normal,
+    expected outcome (private/renamed/typo'd repo), never a crash. The detail
+    is a short git-stderr summary; the agent must phrase this as 'can't reach',
+    never 'doesn't exist' (D47)."""
+    print(json.dumps({
+        "status": "unreachable",
+        "url": url,
+        "identity": identity,
+        "detail": detail,
+    }, ensure_ascii=False))
+    sys.exit(5)
+
+
+# --- identity normalization (mirrors digest-schema.yaml identity rules: host +
+# full namespace path + repo, lowercased, .git stripped; https/ssh/scp-style
+# spellings collapse to one identity). Kept in sync only via a contract decision.
+_SCP_RE = re.compile(r"^(?P<user>[^@/]+)@(?P<host>[^:/]+):(?P<path>.+)$")
+_SEG_OK_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def normalize_identity(url: str):
+    """Return (identity, canonical_url) or None if the URL is not a parseable
+    git remote. identity = '<host>/<org-path>/<repo>' lowercased; canonical_url
+    is the https form used for the actual clone. Subgroups (GitLab) are kept."""
+    raw = url.strip()
+    host = None
+    path = None
+    # file:// (test fixtures, per digest-schema.yaml): host='file', org-path=parent
+    # dir, repo=repo dir. The canonical URL is the real local path, so the clone
+    # reads a local repo with no network.
+    if raw.startswith("file://"):
+        abspath = raw[len("file://"):]
+        abspath = abspath.rstrip("/")
+        if not abspath.startswith("/"):
+            return None
+        repo = os.path.basename(abspath)
+        parent = os.path.basename(os.path.dirname(abspath))
+        if not repo or not parent:
+            return None
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        for seg in (parent, repo):
+            if seg in (".", "..") or not _SEG_OK_RE.match(seg):
+                return None
+        return f"file/{parent.lower()}/{repo.lower()}", f"file://{abspath}"
+    if raw.startswith("https://") or raw.startswith("http://") or raw.startswith("git://"):
+        rest = raw.split("://", 1)[1]
+        if "/" not in rest:
+            return None
+        host, path = rest.split("/", 1)
+    elif raw.startswith("ssh://"):
+        rest = raw.split("://", 1)[1]
+        if "@" in rest:
+            rest = rest.split("@", 1)[1]
+        if "/" not in rest:
+            return None
+        host, path = rest.split("/", 1)
+    else:
+        m = _SCP_RE.match(raw)
+        if not m:
+            return None
+        host, path = m.group("host"), m.group("path")
+    host = host.split("@")[-1].split(":")[0].strip().lower()
+    # strip a trailing .git and any surrounding slashes
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    segments = [s for s in path.split("/") if s]
+    if not host or len(segments) < 2:
+        return None
+    # reject traversal / odd segments so identity can't escape the clones root
+    for seg in segments:
+        if seg in (".", "..") or not _SEG_OK_RE.match(seg):
+            return None
+    identity = "/".join([host] + [s.lower() for s in segments])
+    canonical_url = f"https://{host}/{'/'.join(segments)}.git"
+    return identity, canonical_url
+
+
+# --- name->identity index (D7) ----------------------------------------------
+# A small JSON map under the state root that lets a bare-name re-ask ("p-limit")
+# resolve to a known identity + canonical URL without re-searching, and records the
+# canonical URL the background needs for drift (Codex #7). It also holds the digests
+# known for an identity, so a lookup over multiple digests per identity is one read
+# (Codex #10). It is an OPTIMIZATION: every write is fail-silent and never blocks
+# acquisition; a miss just means "go search". Atomic multi-writer hardening is T7.
+INDEX_VERSION = 1
+
+
+def index_path(root: str) -> str:
+    return os.path.join(root, "identity-index.json")
+
+
+def _empty_index() -> dict:
+    return {"version": INDEX_VERSION, "aliases": {}, "identities": {}}
+
+
+def load_index(root: str) -> dict:
+    """Load the index, returning a fresh skeleton on a missing / corrupt / malformed
+    file. Never raises -- a broken index degrades to 'no cache', not a crash."""
+    try:
+        with open(index_path(root), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, ValueError, OSError):
+        return _empty_index()
+    if not isinstance(data, dict) or not isinstance(data.get("aliases"), dict) \
+            or not isinstance(data.get("identities"), dict):
+        return _empty_index()
+    return data
+
+
+def save_index(root: str, idx: dict) -> bool:
+    """Atomically write the index (temp + os.replace). Returns False on any error
+    instead of raising -- the index is best-effort, never load-bearing for a fetch."""
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        path = index_path(root)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(idx, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def derive_aliases(identity: str):
+    """The aliases an identity is reachable by, lowest-effort first: the repo
+    basename ('p-limit'), org/repo ('sindresorhus/p-limit'), and the full identity.
+    identity is already lowercased, so these are too. De-duplicated, order-stable."""
+    segs = [s for s in identity.split("/") if s]
+    out = []
+    if segs:
+        out.append(segs[-1])
+    if len(segs) >= 2:
+        out.append("/".join(segs[-2:]))
+    out.append(identity)
+    seen, uniq = set(), []
+    for a in out:
+        if a and a not in seen:
+            seen.add(a)
+            uniq.append(a)
+    return uniq
+
+
+def index_record(root: str, identity: str, canonical_url: str,
+                 extra_aliases=None, digest: str = None) -> bool:
+    """Upsert an identity: store its canonical URL, register its aliases (auto-derived
+    + any extra package/import names a caller passes), and optionally append a digest
+    path (multiple digests per identity, Codex #10). Fail-silent -- returns the
+    save_index result but a False never propagates as an error to the fetch."""
+    idx = load_index(root)
+    ents = idx["identities"]
+    ent = ents.get(identity) or {"canonical_url": canonical_url, "aliases": [], "digests": []}
+    if canonical_url:
+        ent["canonical_url"] = canonical_url
+    aliases = list(derive_aliases(identity))
+    if extra_aliases:
+        aliases += [a for a in extra_aliases if a]
+    for a in aliases:
+        al = a.strip().lower()
+        if not al:
+            continue
+        idx["aliases"][al] = identity
+        if a not in ent["aliases"]:
+            ent["aliases"].append(a)
+    if digest and digest not in ent["digests"]:
+        ent["digests"].append(digest)
+    ents[identity] = ent
+    return save_index(root, idx)
+
+
+def index_resolve(root: str, query: str) -> dict:
+    """Resolve a query to a known identity. A URL / clone-spec normalizes directly
+    (answerable even when absent from the index); a bare name is looked up in the
+    alias map. Read-only -- recording happens on fetch/persist, never here. Returns a
+    result dict: status 'ok' (with identity/url/aliases/digests/matched/from_index)
+    or 'unknown' (a bare name not in the index -- the caller should search)."""
+    raw = (query or "").strip()
+    idx = load_index(root)
+    norm = normalize_identity(raw)
+    if norm is not None:
+        identity, canonical_url = norm
+        ent = idx["identities"].get(identity)
+        return {
+            "status": "ok",
+            "matched": "url",
+            "from_index": ent is not None,
+            "identity": identity,
+            "url": (ent or {}).get("canonical_url") or canonical_url,
+            "aliases": (ent or {}).get("aliases", []),
+            "digests": (ent or {}).get("digests", []),
+        }
+    identity = idx["aliases"].get(raw.lower())
+    ent = idx["identities"].get(identity) if identity else None
+    if ent is not None:
+        return {
+            "status": "ok",
+            "matched": "alias",
+            "from_index": True,
+            "identity": identity,
+            "url": ent.get("canonical_url", ""),
+            "aliases": ent.get("aliases", []),
+            "digests": ent.get("digests", []),
+        }
+    return {"status": "unknown", "query": raw}
+
+
+# --- consult: serve a cached claim (CC-T2) ----------------------------------
+# The foreground/background split is the grade boundary (claim-cache design): the
+# foreground is served a citation-STRIPPED view (claim text + the grade tag, never
+# the raw ⟦path:Lx-Ly⟧@sha markup), the background gets the full cited digest. The
+# strip is enforced HERE in the binary, not as a prose rule, so "the foreground view
+# never contains ⟦⟧@sha" is a guarantee. A local read only -- no network, no clone.
+GRADE_RANK = {"run": 3, "inspect": 2, "docs": 1}
+
+# Strip any reserved-bracket token (a citation or the ⟦recall⟧ marker) plus an
+# optional @sha12 suffix. Deliberately broad: the foreground invariant is "no ⟦ and
+# no raw markup", so anything between ⟦ and ⟧ goes.
+_CITE_STRIP_RE = re.compile(r"⟦[^⟧]*⟧(?:@[0-9a-f]{12})?")
+
+
+def digest_roots(root: str):
+    """Where digests live: local (persisted by cold runs, ~/.tesser/digests/) and
+    bundled (curated keepers shipped in the skill repo's digests/)."""
+    local = os.path.join(root, "digests")
+    bundled = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "digests"
+    )
+    return [local, bundled]
+
+
+def find_digests(root: str, identity: str):
+    """All digest files for an identity across both roots (the multiple-digests-per-
+    identity lookup, Codex #10). The path layout is <root>/<host>/<org-path>/<repo>@
+    <sha12>.md, so the files are '<repo>@*.md' in the identity's parent dir."""
+    segs = [s for s in identity.split("/") if s]
+    if not segs:
+        return []
+    repo, sub = segs[-1], segs[:-1]
+    found = []
+    for r in digest_roots(root):
+        d = os.path.join(r, *sub)
+        if not os.path.isdir(d):
+            continue
+        for name in sorted(os.listdir(d)):
+            if name.startswith(repo + "@") and name.endswith(".md"):
+                found.append(os.path.join(d, name))
+    return found
+
+
+def split_frontmatter(text: str):
+    """Return (frontmatter_text, body_text) for a '---\\n…\\n---\\n<body>' digest.
+    No YAML dependency -- fetch stays stdlib-only (the venv is the validator's)."""
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return "", text
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "".join(lines[1:i]), "".join(lines[i + 1:])
+    return "".join(lines[1:]), ""
+
+
+def _fm_scalar(fm: str, key: str) -> str:
+    """Pull a top-level scalar (sha / truth_grade / ts) out of frontmatter text by
+    line, unquoting. Enough for digest SELECTION; not a general YAML parser."""
+    m = re.search(rf"^{re.escape(key)}:[ \t]*(.+?)[ \t]*$", fm, re.MULTILINE)
+    if not m:
+        return ""
+    v = m.group(1).strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return v
+
+
+def parse_digest_meta(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return {"path": path, "text": "", "body": "", "sha": "", "grade": "", "ts": ""}
+    fm, body = split_frontmatter(text)
+    return {
+        "path": path, "text": text, "body": body,
+        "sha": _fm_scalar(fm, "sha"),
+        "grade": _fm_scalar(fm, "truth_grade"),
+        "ts": _fm_scalar(fm, "ts"),
+    }
+
+
+def select_best_digest(paths):
+    """Deterministic digest selection (the plumbing half; WHICH CLAIM within it is
+    latent + eval-gated, CC-T6). Highest grade, then newest ts, then sha desc -- a
+    total order so the pick is stable. (Claim-level tie-break is a maintainer open.)"""
+    metas = [parse_digest_meta(p) for p in paths]
+    metas.sort(key=lambda m: (GRADE_RANK.get(m["grade"], 0), m["ts"], m["sha"]),
+               reverse=True)
+    return metas[0]
+
+
+def strip_citations(body: str) -> str:
+    """Remove every reserved-bracket token (citation or ⟦recall⟧) + optional @sha12,
+    then tidy the space the token left behind. The grade travels separately, as a
+    tag -- this is the model-visible view: claim text, no file:line markup."""
+    s = _CITE_STRIP_RE.sub("", body)
+    s = re.sub(r"[ \t]+([.,;:!?])", r"\1", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip()
+
+
+def run_git(args, cwd=None):
+    """Run a git command, returning (returncode, stdout, stderr). Never raises
+    on a nonzero git -- a failed clone is a normal outcome, not an exception."""
+    proc = subprocess.run(
+        ["git"] + args,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def clone_dir(root: str, identity: str) -> str:
+    return os.path.join(root, "clones", identity)
+
+
+def is_clone(path: str) -> bool:
+    return os.path.isdir(os.path.join(path, ".git"))
+
+
+def short_stderr(stderr: str) -> str:
+    """One-line summary of git's failure for the unreachable detail."""
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    return lines[-1] if lines else "git failed with no output"
+
+
+def ensure_clone(root: str, identity: str, canonical_url: str, url: str) -> str:
+    """Ensure a treeless+sparse clone exists for this identity; return its path.
+    Reuse an existing clone (warm path, offline -- no network, no re-verify). On
+    a fresh clone, a failure is reported as unreachable."""
+    path = clone_dir(root, identity)
+    if is_clone(path):
+        return path
+    # A partial/corrupt dir from an interrupted clone must not poison reuse.
+    if os.path.exists(path):
+        shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    rc, _out, err = run_git([
+        "clone", "--depth", "1", "--filter=blob:none", "--sparse",
+        canonical_url, path,
+    ])
+    if rc != 0 or not is_clone(path):
+        shutil.rmtree(path, ignore_errors=True)
+        emit_unreachable(url, identity, short_stderr(err))
+    return path
+
+
+def materialize(path: str, level: str) -> None:
+    """Set the sparse-checkout for the requested level on an existing clone.
+    docs -> root files + docs/ dirs; source -> the full working tree."""
+    if level == "docs":
+        run_git(["sparse-checkout", "set", *DOCS_DIRS], cwd=path)
+    else:  # source
+        run_git(["sparse-checkout", "disable"], cwd=path)
+
+
+def list_materialized(path: str, level: str):
+    """Return repo-relative paths of what the agent should read, deterministically
+    ordered. docs -> root doc files + files under docs dirs; source -> top-level
+    tracked entries (not the whole tree -- the agent greps from `root`)."""
+    out = []
+    if level == "docs":
+        for entry in sorted(os.listdir(path)):
+            full = os.path.join(path, entry)
+            if entry == ".git" or os.path.isdir(full):
+                continue
+            stem = entry.split(".")[0].lower()
+            if stem in DOCS_ROOT_STEMS:
+                out.append(entry)
+        for d in DOCS_DIRS:
+            ddir = os.path.join(path, d)
+            if not os.path.isdir(ddir):
+                continue
+            for dirpath, _dirs, files in os.walk(ddir):
+                for f in sorted(files):
+                    rel = os.path.relpath(os.path.join(dirpath, f), path)
+                    out.append(rel)
+    else:  # source
+        for entry in sorted(os.listdir(path)):
+            if entry == ".git":
+                continue
+            out.append(entry + ("/" if os.path.isdir(os.path.join(path, entry)) else ""))
+    return out
+
+
+def cmd_fetch(level: str, url: str, aliases=None) -> None:
+    if shutil.which("git") is None:
+        fail_env("git is not on PATH")
+    norm = normalize_identity(url)
+    if norm is None:
+        fail_usage(f"not a parseable git URL: {url!r}")
+    identity, canonical_url = norm
+    root = state_root()
+    existed = is_clone(clone_dir(root, identity))
+    path = ensure_clone(root, identity, canonical_url, url)
+    materialize(path, level)
+    rc, sha, err = run_git(["rev-parse", "HEAD"], cwd=path)
+    if rc != 0:
+        # A clone with no resolvable HEAD is an environment failure, not an
+        # unreachable repo (we already cloned it).
+        fail_env(f"rev-parse HEAD failed in {path}: {short_stderr(err)}")
+    # Record into the name->identity index so a later bare-name re-ask resolves
+    # without searching (D7). The URL-derived aliases (repo basename / org-repo) are
+    # auto-added; --alias carries the package/import name the developer actually typed
+    # (e.g. "lru-cache" for the repo "node-lru-cache"), which the URL path cannot
+    # supply. Best-effort: an index write must never fail a fetch.
+    try:
+        index_record(root, identity, canonical_url, extra_aliases=aliases)
+    except Exception:
+        pass
+    print(json.dumps({
+        "status": "ok",
+        "identity": identity,
+        "url": canonical_url,
+        "sha": sha.strip(),
+        "level": level,
+        "root": path,
+        "files": list_materialized(path, level),
+        "from_cache": existed,
+    }, ensure_ascii=False))
+
+
+def cmd_resolve(query: str) -> None:
+    """Foreground bare-name / URL lookup against the name->identity index (D7).
+    Always exits 0: an 'unknown' status is a normal 'go search' signal, not an
+    error. Only a missing argument is a usage error (handled by argparse)."""
+    print(json.dumps(index_resolve(state_root(), query), ensure_ascii=False))
+
+
+def cmd_consult(query: str, background: bool) -> None:
+    """Serve a cached claim for a name/URL (CC-T2). Default (foreground) returns the
+    citation-STRIPPED view (claim text + grade tag, no ⟦⟧@sha markup); --background
+    returns the full cited digest. A 'miss' (no identity or no digest) exits 0 -- it
+    is the normal signal to ground fresh, not an error."""
+    root = state_root()
+    res = index_resolve(root, query)
+    if res.get("status") != "ok":
+        print(json.dumps({"status": "miss", "reason": "unknown-identity",
+                          "query": query}, ensure_ascii=False))
+        return
+    identity = res["identity"]
+    paths = find_digests(root, identity)
+    if not paths:
+        print(json.dumps({"status": "miss", "reason": "no-digest",
+                          "identity": identity}, ensure_ascii=False))
+        return
+    best = select_best_digest(paths)
+    common = {
+        "status": "hit",
+        "identity": identity,
+        "sha": best["sha"],
+        "truth_grade": best["grade"],
+        "digest_path": best["path"],
+    }
+    if background:
+        # Full provenance: the cited digest verbatim. The background actor may open
+        # citations, clone, build -- it gets the markup.
+        common.update({"view": "background", "content": best["text"]})
+    else:
+        # Model-visible: claim text + grade, NEVER the raw ⟦⟧@sha markup (the
+        # citation-opening invariant, enforced here in the binary).
+        common.update({"view": "foreground", "grade": best["grade"],
+                       "claims": strip_citations(best["body"])})
+    print(json.dumps(common, ensure_ascii=False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="fetch",
+        description="Deterministic docs/source acquisition for tesser grounding "
+                    "(grounding-design.md). Caching, pin, and verify are internal.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    for level in ("docs", "source"):
+        p = sub.add_parser(level, help=f"materialize {level} for a repo, print JSON")
+        p.add_argument("url", help="the git URL (recalled, pasted, or search-resolved)")
+        p.add_argument(
+            "--alias", action="append", metavar="NAME",
+            help="a package/import name the developer typed for this repo (repeatable); "
+                 "recorded into the index so a later bare-name re-ask resolves (D7). "
+                 "Use when the typed name differs from the repo basename.",
+        )
+        p.set_defaults(level=level)
+    pr = sub.add_parser(
+        "resolve",
+        help="resolve a bare name or URL to a known identity (index lookup), print JSON",
+    )
+    pr.add_argument("query", help="a bare package/import name, or a git URL")
+    pc = sub.add_parser(
+        "consult",
+        help="serve the cached claim for a name/URL: foreground stripped view "
+             "(claim + grade), or --background full cited digest. Print JSON.",
+    )
+    pc.add_argument("query", help="a bare package/import name, or a git URL")
+    pc.add_argument(
+        "--background", action="store_true",
+        help="return the full cited digest (the background actor's view) instead "
+             "of the citation-stripped foreground view",
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.command == "resolve":
+        cmd_resolve(args.query)
+    elif args.command == "consult":
+        cmd_consult(args.query, args.background)
+    else:
+        cmd_fetch(args.level, args.url, getattr(args, "alias", None))
+
+
+if __name__ == "__main__":
+    main()

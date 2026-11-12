@@ -1,0 +1,195 @@
+# tesser digest schema — spec-as-data (D2/1A, D5/5A)
+#
+# A digest is the verified-map page for one library at one pinned commit:
+# a single markdown file with YAML frontmatter (provenance) and a markdown
+# body (the grounded overview and cited claims). Consumed by
+# scripts/validate-digest and tests/structure.test.ts (Type-A tests).
+# Change only with a matching build-contract decision.
+
+version: 1
+
+file:
+  format: markdown with YAML frontmatter
+  # D27 + D31 (amends D28): a digest lives at a host-aware path under its
+  # digests root. The trailing path's sha12 MUST equal sha[0:12] of the
+  # frontmatter sha (a renamed digest is invalid), and the directory segments
+  # are the normalized identity below — never a bare library name (same
+  # name on a different host or under a different namespace must not
+  # collide, and GitLab-style subgroups are preserved, not truncated).
+  naming: "<host>/<org-path>/<repo>@<sha12>.md" # path under the digests root
+  locations:
+    bundled: digests/ # ships with the skill, curated keepers (validated recursively)
+    local: ~/.tesser/digests/ # persisted by cold runs after validation (D12)
+
+# Library identity (D31, amends D28). Pin-first reuse and digest paths both
+# key on the normalized identity host + full namespace path, derived from the
+# clone URL:
+#   - scheme/transport equivalence: https://host/org/repo, ssh://git@host/org/repo,
+#     and scp-style git@host:org/repo all normalize to the same identity
+#   - the FULL namespace path is kept: gitlab.com/group/subgroup/repo keeps
+#     all three leading segments (org-path = group/subgroup), never just the
+#     last two
+#   - trailing .git stripped; host and every path segment lowercased
+#   - file:// (fixtures): the host segment is the literal `file`;
+#     org-path = parent directory name, repo = repository directory name
+#     (.git stripped)
+# Forks, aliases, redirects, and monorepo subpaths are explicitly OUT of v1.
+identity:
+  key: host + full namespace path (org-path segments + repo)
+  digest_path: "<host>/<org-path>/<repo>@<sha12>.md"
+  # D50 (provider-anchored, hosted-closed kind): a run whose verified target is a
+  # hosted closed service has no clone URL and no commit, so it cannot key on a
+  # repo identity. It keys on a PROVIDER identity instead — the literal host
+  # segment `provider`, then <vendor>/<service> (lowercased, same normalization;
+  # at least two segments). There is no sha to pin, so the digest-path
+  # discriminator is the observation date YYYYMMDD (derived from observed_at),
+  # not a sha12. A digest is EITHER repo-anchored OR provider-anchored, never both.
+  provider_key: provider + <vendor>/<service> # e.g. provider/clickhouse/cloud
+  provider_digest_path: "provider/<vendor>/<service>@<observed>.md" # <observed> = YYYYMMDD of observed_at
+
+frontmatter:
+  required:
+    repo:
+      type: string
+      # D25: ssh:// is the URL spelling of the already-allowed git@ transport;
+      # file:// is required by the locked D8 hermetic-fixture strategy.
+      pattern: "^(https://|git@|ssh://|file://).+" # canonical clone URL
+    sha:
+      type: string
+      pattern: "^[0-9a-f]{40}$" # full pinned commit, lowercase hex
+    env:
+      type: object # environment the run happened in
+      required_keys: [os, arch]
+      # further keys free-form, e.g. toolchain versions: {go: 1.24.1, python: 3.13.2}
+    commands:
+      type: list # every command run, in execution order
+      min_items: 1
+      # D8 (claim-cache): an overview persisted at docs grade ran no commands, so
+      # commands may be empty THEN — citations are still required (they point at
+      # README/docs lines). Below docs grade the floor stays 1: an inspect/run claim
+      # must show the work that produced it. Declarative so the rule lives in the spec.
+      min_items_relaxed_when: { field: truth_grade, equals: docs, min_items: 0 }
+      item:
+        cmd: { type: string }
+        exit_code: { type: integer }
+    ts:
+      type: string
+      format: iso8601-utc # when the run happened, e.g. 2026-06-10T18:04:00Z
+    dependency_kind:
+      type: string
+      # D20 ladder, re-coded as self-describing slugs by D30 (amends D20's
+      # integer coding; decided while zero digests/log records exist).
+      # required: D20 mandates preflight classification on every run
+      enum: [clonable-cli, clonable-library, sdk-of-hosted-service, hosted-closed, heavy-infra]
+    truth_grade:
+      type: string
+      enum: [run, inspect, docs] # highest grade the digest's claims reach
+      # D26: required — a digest whose grade is unstated defeats the labeling
+      # contract (cited-claims clause); validator rejects when missing
+
+  # D50: the provider-anchored branch. The `required` block above is the
+  # repo-anchored default (repo + sha). A digest is provider-anchored when
+  # `provider` OR `observed_at` is present; the validator then REPLACES the
+  # repo/sha requirement with provider/observed_at, forbids repo/sha, and
+  # (D52) requires scope: personal + reproducible: false. The always-required
+  # fields (env, commands, ts, dependency_kind, truth_grade) still apply.
+  # A run-grade provider digest must carry >=1 ⟦observed⟧ claim (D51).
+  provider_anchor:
+    detect_when: provider present OR observed_at present
+    requires: [provider, observed_at]
+    forbids: [repo, sha]
+    enforces: { scope: personal, reproducible: false } # D52
+    run_grade_requires_observed: true # D51 — >=1 ⟦observed⟧ when truth_grade is run
+    fields:
+      provider:
+        type: string
+        # <vendor>/<service>, lowercased; >=2 segments; no leading/trailing slash
+        pattern: "^[a-z0-9][a-z0-9.-]*(/[a-z0-9][a-z0-9._-]*)+$"
+      observed_at:
+        type: string
+        format: iso8601-utc # when the live service was observed (no commit to pin)
+
+  optional:
+    question:
+      type: string # the developer question that triggered the run, if any
+    # D52: personal / not-reproducible scope. A provider-anchored or credentialed
+    # run sets these; a repo digest defaults to reproducible (absent => true) and
+    # scope shareable (absent => shareable). A personal-scope digest persists to
+    # ~/.tesser/digests/ only and NEVER enters the bundled digests/ set.
+    reproducible:
+      type: boolean # false for provider/credentialed runs; absent defaults true
+    scope:
+      type: string
+      enum: [shareable, personal] # absent defaults shareable
+
+body:
+  # D18 citation grammar, revised to v1.1 by D24. sha12 is THE canonical
+  # citation form everywhere (digests, delivered answers, README). Inside a
+  # digest the @sha12 suffix may be omitted and defaults to the frontmatter
+  # sha; when present it MUST equal the frontmatter sha12 — cross-commit
+  # citations are out of v1 and live as prose, never as
+  # validated citations.
+  citation_grammar:
+    version: "1.1"
+    full: "⟦path:Lstart-Lend⟧@<sha12>"
+    in_digest: "⟦path:Lstart-Lend⟧" # suffix optional; if present, == frontmatter sha12
+    # D8 (claim-cache): the recall/training provenance marker. A claim fused or
+    # persisted from model training (not source-grounded) is tagged ⟦recall⟧ so it
+    # is honestly labeled and never laundered as source-grounded. It carries no path
+    # and no sha (there is no commit), so it is exempt from quote-in-range. It reuses
+    # the reserved ⟦⟧ delimiter so token-totality still holds (every ⟦ begins a token
+    # that fully matches token_pattern; learning: reserved-delimiter-validation-totality).
+    recall: "⟦recall⟧"
+    # D51 (provider-anchored): the run-observation provenance marker. A fact
+    # established by OPERATING a live service (run-grade empirical) is tagged
+    # ⟦observed⟧ — not source-grounded (no repo line governs it) and not recall
+    # (not training). Like recall it carries no path and no sha (there is no
+    # commit), is exempt from quote-in-range, reuses the reserved ⟦⟧ delimiter
+    # (token-totality holds), and forbids a trailing @ (⟦observed⟧@<hex> is
+    # malformed, never split). Bare in v1. Prevents the category error of citing
+    # a repo's source for a managed service's observed behavior.
+    observed: "⟦observed⟧"
+    # Anchored (D24): a malformed suffix — wrong length (8-hex, 17-hex) or an
+    # alphanumeric continuation — invalidates the WHOLE token instead of
+    # partially matching as a bare citation. Line numbers are 1-based with no
+    # leading zeros, so L0 ranges fail at the pattern.
+    # Path charset (D37, strictness-only v1.1 amendment): the path part also
+    # excludes ⟦ and newlines, so a stray ⟦ can never merge into the next
+    # citation's path and pass structural validation as one token.
+    # Two alternatives: the recall provenance marker (⟦recall⟧, no path/sha/suffix),
+    # or a file citation. The recall branch forbids a trailing @ so ⟦recall⟧@<hex> is
+    # rejected as malformed, not silently split (recall takes no commit).
+    token_pattern: "(?:⟦recall⟧(?!@)|⟦observed⟧(?!@)|⟦[^⟧⟦:\\n\\r]+:L[1-9][0-9]*-L[1-9][0-9]*⟧(?:@[0-9a-f]{12}(?![0-9a-zA-Z]))?(?!@))"
+    range_rule: "1 <= Lstart <= Lend; a reversed range (e.g. L90-L10) is invalid"
+    path_rule: "cited paths are normal repo-relative paths: no leading /, no
+      '..' or '.' segments, no empty segments (D37)"
+    # D24 serve-path rewrite: when digest content is delivered as an answer,
+    # bare in-digest citations are rewritten to the full form by appending
+    # @<frontmatter sha12> at egress. A delivered answer never contains a
+    # bare citation.
+    serve_path_rewrite: append @<frontmatter sha12> to bare citations at egress
+  rules:
+    - every load-bearing claim carries a citation
+    - "quote-in-range: every cited path must exist and every cited line range
+      must be within the file's length at the frontmatter sha (deterministic
+      check, scripts/validate-digest, D18)"
+    - "suffix-equals-sha: any explicit @sha12 suffix inside a digest must
+      equal the frontmatter sha[0:12]; otherwise the digest is invalid (D24)"
+    - "token-totality: every occurrence of ⟦ in the body must begin a span
+      that fully matches token_pattern; a malformed citation token is a
+      validation failure, not prose (D24)"
+    - "path-normality: every cited path must satisfy path_rule — traversal
+      (../), absolute paths, and '.' or empty segments are validation
+      failures at the grammar stage, before any git resolution (D37)"
+    - claims below the digest's truth_grade are individually labeled with
+      their own grade
+    - "recall-provenance (D8): ⟦recall⟧ is a valid citation token marking a
+      training/recall-sourced claim; it has no path or sha and is exempt from
+      quote-in-range. A recall claim is grade-labeled recall, never served as
+      source-grounded (the no-laundering rule)."
+    - "observed-provenance (D51): ⟦observed⟧ is a valid citation token marking a
+      fact established by operating a live service; it has no path or sha and is
+      exempt from quote-in-range. It is never served as source-grounded or recall
+      (the no-laundering rule). A provider-anchored digest at truth_grade run MUST
+      carry at least one ⟦observed⟧ claim — a run-grade label with no observation
+      is the overclaim the marker exists to prevent."

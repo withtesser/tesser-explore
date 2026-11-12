@@ -1,0 +1,226 @@
+# tesser behavior contract — spec-as-data (D5/5A)
+#
+# Tests pin against this file: tests/structure.test.ts reads the clause list
+# and asserts SKILL.md contains the literal anchor `contract:<id>` for every
+# clause. Change a clause only with a matching build-contract decision.
+
+version: 1
+
+# SKILL.md must contain this literal string for each clause below.
+anchor_format: "contract:<id>"
+
+# Byte budget for SKILL.md, pinned here so the test reads it as data. SKILL.md is
+# the main-thread router + dev-facing output contract + build path; the grounding
+# machinery moved to subagent-brief.md (read by the background subagent in its own
+# context), which carries its own, looser budget.
+skill_md:
+  max_bytes: 16384
+subagent_brief:
+  max_bytes: 12288
+
+clauses:
+  - id: cited-claims
+    delta: true # value-over-baseline delta (i)
+    source: ["design §Narrowest Wedge (i)", "D18", "D24"]
+    statement: >-
+      Never assert from memory as established fact. Every load-bearing claim
+      in a delivered answer carries a citation in the grammar
+      ⟦path:Lstart-Lend⟧@sha12 (citation grammar v1.1, digest-schema.yaml),
+      resolving to the cloned source at the cited commit. sha12 — the first
+      12 hex chars of the pinned commit — is the canonical citation form
+      everywhere. Anything not yet citable is explicitly labeled with its
+      current truth-grade rather than asserted.
+
+  - id: always-verify
+    delta: true # value-over-baseline delta (ii)
+    source: ["design §Narrowest Wedge (ii)", "D3/2A", "D20", "D30", "D49"]
+    statement: >-
+      Every run builds and verifies by use, credentials-free by default, via
+      the fallback ladder: runnable binary > test suite > minimal example.
+      Credentials-free is the axiom: the background grounding subagent never
+      asks for or uses the developer's credentials. The one exception (D49,
+      contract:provider-grounded) is an explicit per-session developer opt-in
+      to operate a credentialed hosted service — main-thread, dev-supervised.
+      Credential handling follows one general pattern for any auth type (not a
+      fixed enumeration): the secret is referenced, never read literally (an
+      env-file path sourced into the environment, or an env var — never the
+      key value in a command or the transcript); the run uses the narrowest,
+      most-revocable identity the provider offers (a revocable API key as-is,
+      or a scoped throwaway principal explicitly torn down when the platform's
+      native credentials are broad, e.g. cloud IAM), never the developer's
+      primary creds; and no credential machinery is built or persisted.
+      Credentials for eval scaffolding tesser itself stands up (e.g. running
+      benchmarks in tesser's own cloud) are a distinct credential role handled
+      under the same pattern — standing up that infrastructure is a v2
+      capability, acknowledged and deferred in v1. Its findings are never
+      persisted by the background auto-persist.
+      Preflight classifies the dependency kind (clonable-cli /
+      clonable-library / sdk-of-hosted-service / hosted-closed /
+      heavy-infra, the D20 ladder as D30 slugs) and, when the kind caps
+      verification below run-grade, states the truth-grade ceiling before
+      working and discloses the delivered grade in the answer. A prior
+      verified run at the same repo@SHA, served via a validated digest or
+      reused artifacts, satisfies this clause; SHA drift between digest and
+      repo is flagged per digest-consult.
+
+  - id: provider-grounded
+    delta: true # value-over-baseline delta — persists credentialed/non-repo runs
+    source: ["D49", "D50", "D51", "D52", "D53", "retro (2026-06-25)"]
+    # The highest-value runs operate a live hosted service (AWS Lambda microVMs,
+    # ClickHouse Cloud) and produced run-verified facts that fell on the floor
+    # because the cache models a git repo, not a learned-by-operating fact. This
+    # clause is the minimal carve-out: a non-repo identity, an honest provenance
+    # marker, a personal scope, and a deliberate manual persist.
+    statement: >-
+      A run whose verified target is a hosted closed service (no clonable repo)
+      is grounded and persisted as a PROVIDER-ANCHORED digest: identity
+      provider/<vendor>/<service>, pinned by the observation date (no commit),
+      with the clone-bound validator checks inapplicable by kind. Facts
+      established by operating the live service carry the ⟦observed⟧ provenance
+      marker (D51) — run-grade but never laundered as source-grounded or recall;
+      a run-grade provider digest carries at least one ⟦observed⟧ claim. Such a
+      digest is personal and not reproducible (scope: personal, reproducible:
+      false, D52): it persists to ~/.tesser/digests/ for the operating developer
+      only and never enters the bundled digests/ set. Writing one is a deliberate,
+      developer-invoked step (D53) that this repository does not ship; the
+      background auto-persist never reaches the credentialed/non-repo path. When
+      a run-grade or credentialed investigation ran and the session ends with
+      nothing persisted, tesser says so plainly ("this run isn't persisted")
+      rather than believing it cached when it did not.
+
+  - id: question-led
+    delta: true # value-over-baseline delta (iii)
+    source: ["design §Narrowest Wedge (iii)"]
+    statement: >-
+      The developer's actual question leads every response. Build and
+      verification reporting never buries the answer; survey output exists
+      to serve the question, not the reverse.
+
+  - id: digest-consult
+    delta: true # value-over-baseline delta (iv)
+    # surface: script (grounding-design.md, 2026-06-17) — the reuse cache, the
+    # pin, and implicit verification are owned by scripts/fetch, a deterministic
+    # binary, not agent prose. Demoted from a playbook anchor to a script-internal
+    # behavior assured by the fetch unit tests (tests/fetch.test.ts). The digest
+    # ARTIFACT (validated, citeable, bundleable map) still exists on the build path.
+    surface: script
+    source: ["design §Narrowest Wedge (iv)", "D12", "D14", "D22", "D24", "D34", "D35", "D2 (claim-cache, CC-T2)"]
+    statement: >-
+      Before cold work, consult the cache for the library — bundled digests
+      (digests/ in the skill repo) and local digests (~/.tesser/digests/) —
+      via scripts/fetch consult. The foreground/background split is the grade
+      boundary: the consult helper serves the FOREGROUND a citation-STRIPPED
+      view (the claim text + its grade tag docs|inspect|run|recall, never the
+      raw ⟦path:Lstart-Lend⟧@sha12 markup, which the foreground never opens)
+      and the BACKGROUND the full cited digest. The four provenance surfaces
+      stay distinct (Codex #4): digest provenance (full markup in the stored
+      claim), model-visible (the grade tag), developer-visible (plain English
+      — raw markup never reaches the developer, the D24 egress rule), and log
+      (the named digest path consulted_cached_digest + its digest_sha256,
+      passive evidence only, never verified at serve time, D35). A cached
+      claim outranks raw recall only when relevant, in-scope, and answering
+      this question — a stale or mismatched claim does not auto-dominate.
+      Drift handling is async (D22): the digest is served immediately,
+      labeled drift-unchecked; the background clone computes any SHA drift
+      between the digest and the repo's current state; a superseding follow-up
+      delivers the drift verdict, per provisional-first mechanics. Offline
+      stays honestly drift-unchecked. Cold runs persist a new digest to
+      ~/.tesser/digests/ only per the validator's exit code (D34): 0 persist
+      (logging digest_sha256), 1 discard, 4 keep the artifacts and retry
+      validation — an environment failure is not a property of the digest.
+
+  - id: invocation-log
+    delta: true # value-over-baseline delta (v)
+    source: ["design §Instrument", "D4/3A", "D6/6A", "D14", "D20", "D21"]
+    statement: >-
+      Every invocation opens a log record via scripts/log-invocation at
+      start and finalizes it at end. The record shape — field set, enums,
+      lifecycle, and outcome semantics (digest-served = completed with
+      consulted_cached_digest set; a walked-away run legitimately stays
+      opened, never force-finalized) — is pinned as data by log-schema.yaml
+      (D21). Any failed step (clone, survey, build, verify) captures
+      failing_command and exit_code. Every record logs dependency_kind (the
+      D20 preflight classification), so unservable moments become demand
+      data. The log is local-only at ~/.tesser/log.jsonl; nothing leaves
+      the machine.
+
+  - id: idempotent-reuse
+    delta: false
+    # surface: script (grounding-design.md, 2026-06-17) — pin-first reuse is the
+    # fetch script's job: it clones once, pins rev-parse HEAD, and reuses the clone
+    # at that SHA, never chasing upstream. The agent never reasons about it.
+    # Assured by tests/fetch.test.ts (cache hit/miss, pin held across docs->source).
+    surface: script
+    source: ["D11", "D28", "D31"]
+    statement: >-
+      Pin-first reuse: the SHA is pinned at first clone, and every later
+      invocation for the same library reuses the existing clone, build
+      artifacts, and digest at that pinned SHA. tesser never auto-chases
+      upstream. Re-pin and redo only on explicit developer request or on
+      missing/corrupt local state. Library identity is the normalized
+      host + full namespace path of the clone URL (digest-schema.yaml
+      identity rule, D31); equivalent URL spellings are one library, one
+      clone, one digest.
+
+  - id: provisional-first
+    delta: false
+    source: ["D19", "T11 spike 2026-06-11"]
+    # "Upgrade in place" corrected to observed host mechanics (T11): an agent
+    # cannot edit already-emitted text; the upgrade is a superseding follow-up.
+    statement: >-
+      Serve a provisional answer immediately at the current truth-grade,
+      explicitly labeled as provisional. Launch build-and-verify as a
+      background task in the same turn. When the completion notification
+      lands, verify the artifact and supersede the provisional answer with
+      an upgraded answer at the new truth-grade, as an explicit follow-up
+      in the same session — a delivered answer is never silently edited.
+      If the session ends before the build lands, the next invocation finds
+      the finished build state under ~/.tesser/ and serves the upgraded
+      grade from it. Never block the developer's flow on a compile.
+
+  - id: readme-first
+    delta: true # value-over-baseline delta — closes the empty-beat-1 / slow-overview gap
+    source: ["D47 (2026-06-15 eng-review)", "scoreboard faster", "D3 (claim-cache, CC-T4)"]
+    # When the model does not recognize the dependency (tesser's founding case),
+    # "answer from memory" has nothing to draw on, so beat 1 degenerated to a
+    # holding line ("I don't know this, reading now") and the developer waited
+    # for the clone — failing the FASTER hard gate on the exact case tesser
+    # exists for. README-first grounds beat 1 in the project's own docs, fast.
+    # 2026-06-17 (grounding-design.md): amends D47's mechanism — the fast docs
+    # acquisition is `scripts/fetch docs` (a treeless+sparse clone, ~1s, NOT a
+    # full clone), not a raw gh-api GET. D47's motivation (don't pay full-clone
+    # cost for an overview) stands; "never a clone" was rejecting the wrong thing.
+    # And the status line is now GATED: only an unrecognized URL that needs a
+    # search warrants one; a known/pasted URL leads silently with the docs answer.
+    statement: >-
+      When the model does not already know the dependency, the immediate
+      answer is grounded in the project's own docs first — one fast, SHA-pinned
+      acquisition via scripts/fetch docs (a treeless+sparse clone, ~1s, not a
+      full clone), never blocking — and conveyed in plain language as the
+      project's own documentation (docs-grade: the lowest verified rung,
+      above memory and below reading the source), never asserted as verified
+      behavior. A holding-line acknowledgment in place of a real answer is the
+      FASTER failure this clause removes. A status line is gated to a genuine
+      wait: only an unrecognized URL that must be searched for warrants the one
+      "searching — paste the URL to skip" line; a known or pasted URL leads
+      silently with the docs answer, because narrating a fast deterministic
+      fetch is machinery noise. Deepening to the source (scripts/fetch source)
+      and any build are background work, never narrated; the deterministic
+      fetch is the licensed acquisition, and the agent runs no other machinery
+      in the foreground. The foreground docs fetch is ephemeral (the developer's
+      beat-1 answer), but the BACKGROUND grounding of that overview persists a
+      docs-grade digest (D3, reversing D47's "overview persists nothing") so the
+      next ask for the dep serves from cache — the persist is the background
+      actor's, never the foreground's, and goes through validate-digest like any
+      other (commands empty at docs grade, citations to the lines read).
+
+  - id: self-update
+    delta: false
+    source: ["D15", "D23"]
+    statement: >-
+      At invocation, run a quiet git pull --ff-only in the skill's own
+      directory, bounded by a hard 5-second time limit. Fail-silent:
+      offline, timed out, or diverged means the pull is skipped and the run
+      proceeds on the current checkout — the pull never blocks an answer
+      beyond the bound. Installs without a .git directory (zip) skip it
+      entirely. The behavior is disclosed in the README.

@@ -1,0 +1,431 @@
+// tesser scoreboard scorer (T7) — the three-axis scorers.
+//
+// This is the executable form of scoreboard.yaml (D39/D40): it turns the
+// measurement contract's axes into deterministic numbers from a session
+// transcript. The bars and the forbidden-lexicon list are READ FROM
+// scoreboard.yaml at runtime (spec-as-data, the same pattern validate-digest
+// uses with digest-schema.yaml) — so the maintainer's pre-committed
+// post-dogfood revision reflows in by editing the YAML, not this code.
+//
+// What is deterministic here: FASTER (TTFA), DIGESTIBLE (lexicon leak,
+// citation placement, length, answer-leads), and CALIBRATED Obligation A
+// (provenance attachment count) + gap-surfacing proxy. What is NOT scored
+// here: CALIBRATED Obligation B (faithful confidence) — it has an agent-judged
+// tail (scoreboard.yaml axes.calibrated.deterministic) and is reported as
+// deferred, never silently zero.
+
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import yaml from "js-yaml";
+import {
+  parseSession,
+  questionTurnIndex,
+  type SessionView,
+} from "./parse.ts";
+
+export type Role = "default" | "tesser";
+
+const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+
+// --- scoreboard.yaml as data -----------------------------------------------
+
+interface ScoreboardSpec {
+  ideal_seconds: number;
+  pass_max_seconds: number;
+  lexicon: string[]; // literal jargon terms (the citation-markup item is split out)
+  marker?: RegExp; // optional tesser first-answer marker, if the spec defines one
+}
+
+export function loadScoreboard(path = join(repoRoot, "scoreboard.yaml")): ScoreboardSpec {
+  const doc = yaml.load(readFileSync(path, "utf8")) as Record<string, any>;
+  const faster = doc?.axes?.faster ?? {};
+  const bar = faster.bar ?? {};
+  const leak =
+    doc?.axes?.digestible?.checks?.no_internal_lexicon_leak ?? {};
+  // forbidden_lexicon is the FINAL list (D41); forbidden_lexicon_seed is the
+  // pre-D41 name, kept as a fallback so an older spec still loads.
+  const seed: string[] = leak.forbidden_lexicon ?? leak.forbidden_lexicon_seed ?? [];
+  // The seed list mixes literal terms with one DESCRIPTION of the raw citation
+  // markup ("raw ⟦...⟧@sha citation markup shown to a human"). Split it: literal
+  // terms go to the lexicon scan, the markup is handled by the citation regex.
+  const lexicon = seed.filter((t) => typeof t === "string" && !t.includes("⟦"));
+  const markerSrc: string | undefined =
+    faster.first_answer_marker ?? faster.first_answer_marker_regex;
+  return {
+    ideal_seconds: bar.ideal_seconds ?? 10,
+    pass_max_seconds: bar.pass_max_seconds ?? 30,
+    lexicon,
+    marker: markerSrc ? new RegExp(markerSrc, "i") : undefined,
+  };
+}
+
+// --- shared text views ------------------------------------------------------
+
+/** Raw ⟦path:Lx-Ly⟧ citation markup (optional @sha suffix). The forbidden
+ *  human-facing token AND the provenance-attachment unit (Obligation A). */
+const CITATION = /⟦[^⟧\n]+⟧(@[0-9a-f]{6,40})?/g;
+
+const GREETING_ONLY = /^(hi|hey|hello|yo|sup)\b[\s!.,]*$/i;
+
+/** Process-narration markers tesser currently leads with (scoreboard.yaml
+ *  digestible.answer_leads): the answer must not be buried under these. A lead
+ *  that names the tool/process or its machinery instead of answering is
+ *  narration — a genuine answer to the dev's question never mentions "tesser",
+ *  the log, the pin, the digest, or the cold-run/classification scaffolding. */
+// Markers are anchored to tesser MACHINERY, not bare domain words. A bare
+// domain word (a 2026-06-13 regression: `classification` fired on GDS's "node
+// classification", `cold path` collides with the universal hot/cold-path perf
+// idiom) misreports a real answer as narration. Two rules learned the hard way
+// (after "the skill" — D41 — was the first such collision):
+//   1. Never list a word that a real dependency answer would legitimately use.
+//   2. Anchor an unavoidable domain word to its tesser-machinery context (a kind
+//      slug, a commit sha, a status report) so the collision can't fire.
+// The collision-corpus fixtures in score.test.ts pin both directions.
+const KIND_SLUG = "clonable-cli|clonable-library|sdk-of-hosted-service|hosted-closed|heavy-infra";
+const NARRATION = [
+  /\btesser\b/i, // naming the tool/process in the lead, not the answer
+  /\blog opened\b/i,
+  /\blog id\b/i, // "Log ID is 0a1b2c3d…" — announcing the instrument
+  /\bpinned at\b[\s:`'"]*[0-9a-f]{7,40}\b/i, // "Pinned at d51d8a138f72" (a sha) — NOT "pinned at version 6.0"
+  /\bfound a (local )?digest\b/i,
+  /\bno digest\b/i, // "No digest, no clone — cold path" — narrating the cold branch
+  /\bself-update (done|complete|finished|skipped|ok)\b/i, // the machinery report — NOT "it supports self-update"
+  /\bi have a validated digest\b/i,
+  /^\s*(cold run|preflight)\b/i,
+  // tesser's repo-kind classification leak ("Classification: clonable-library",
+  // "I classified this as a clonable-library") — anchored to a kind slug so a
+  // domain answer ("node classification and link prediction") stays quiet.
+  new RegExp(`classif(y|ied|ication)\\b[^.\\n]{0,40}(${KIND_SLUG})`, "i"),
+];
+
+/** Does this text LEAD with tesser machinery instead of the answer? The
+ *  answer_leads heuristic (digestible) and its recall/bias fixtures both call
+ *  this — keep the one definition. ADVISORY until calibrated against the
+ *  maintainer's tesserts/ dogfooding (see score.test.ts certification block). */
+export function looksLikeNarration(text: string): boolean {
+  return NARRATION.some((re) => re.test(text));
+}
+
+/** Gap-surfacing language (CALIBRATED coverage map proxy). Rough by design;
+ *  the coverage-map quality has an agent-judged tail per scoreboard.yaml. */
+const GAP_LANGUAGE = [
+  // an optional adverb may sit between "couldn't"/"didn't" and the verb
+  // ("couldn't fully verify" was a real miss).
+  /could(n'?t| not) (\w+ )?(run|verify|reach|access|execute|build)/i,
+  /did(n'?t| not) (\w+ )?(verify|run|test|check|build|execute)/i,
+  /(needs?|requires?) a\b[^.]{0,40}\b(key|token|credential|password)/i,
+  /(may be|might be|possibly) (stale|outdated|out of date|wrong)/i,
+  /\bnot (verified|tested|confirmed|run)\b/i,
+  /unable to (run|verify|reach|access|build)/i,
+  /\bfrom (training|memory)\b/i,
+  /without (running|executing|verifying|building)/i,
+  // authority / completeness caveats the default surfaced and we missed
+  /\bcaveat\b/i,
+  /\bworth flagging\b/i,
+  /\b(personal fork|is a fork|it'?s a fork|a fork of)\b/i,
+  /does(n'?t| not) (include|document|support|guarantee|enforce|restrict)/i,
+];
+
+/** Absolute / superlative phrasing that tends to OVERCLAIM (e.g. "instant",
+ *  "guaranteed", "seamlessly"). An advisory CALIBRATED signal and the first
+ *  precursor to the Obligation-B judge — flags candidates for review, not a
+ *  hard gate (a dependency may legitimately describe an "instant" feature). */
+const OVERCLAIM_MARKERS = [
+  /\bin an instant\b/i,
+  /\binstant(ly|aneous(ly)?)?\b/i,
+  /\bguarantee[ds]?\b/i,
+  /\bseamless(ly)?\b/i,
+  /\beffortless(ly)?\b/i,
+  /\btrivially\b/i,
+  /\bnever fails?\b/i,
+  /\balways works?\b/i,
+];
+
+export function countOverclaimMarkers(text: string): number {
+  return OVERCLAIM_MARKERS.reduce((n, re) => n + countMatches(text, re), 0);
+}
+
+/** Count gap-surfacing phrases (CALIBRATED coverage-map proxy). The heuristic
+ *  and its recall/bias fixtures both call this. ADVISORY until calibrated
+ *  (quality of the coverage map has an agent-judged tail; see Obligation B). */
+export function countGapMarkers(text: string): number {
+  return GAP_LANGUAGE.reduce((n, re) => n + countMatches(text, re), 0);
+}
+
+function fullOutput(view: SessionView): string {
+  return view.assistantBlocks.map((b) => b.text).join("\n");
+}
+
+function countMatches(text: string, re: RegExp): number {
+  const g = re.global ? re : new RegExp(re.source, re.flags + "g");
+  return (text.match(g) ?? []).length;
+}
+
+// --- FASTER -----------------------------------------------------------------
+
+export interface FasterScore {
+  ttfaSeconds: number | null;
+  method: "marker" | "250char";
+  firstAnswerBlockIndex: number | null;
+  firstAnswerChars: number;
+  passesHardGate: boolean;
+  meetsIdeal: boolean;
+  note?: string;
+}
+
+export function scoreFaster(
+  view: SessionView,
+  role: Role,
+  spec: ScoreboardSpec,
+  questionTurn?: number,
+): FasterScore {
+  const qi = questionTurnIndex(view, questionTurn);
+  const qTs = view.userTurns[qi]?.ts;
+  const after = view.assistantBlocks
+    .map((b, i) => ({ b, i }))
+    .filter(({ b }) => qTs && b.ts >= qTs);
+
+  let hit: { b: SessionView["assistantBlocks"][number]; i: number } | undefined;
+  let method: FasterScore["method"] = "250char";
+  let note: string | undefined;
+
+  if (role === "tesser" && spec.marker) {
+    hit = after.find(({ b }) => spec.marker!.test(b.text));
+    method = "marker";
+  }
+  if (!hit) {
+    // The first SUBSTANTIVE answer = the first >=250-char block that is NOT
+    // process narration. Skipping narration (looksLikeNarration) finds the real
+    // answer instead of misfiring on a long "Cold run — Preflight…" block, so a
+    // real first answer no longer triggers a spurious warning.
+    hit = after.find(({ b }) => b.chars >= 250 && !looksLikeNarration(b.text));
+    method = "250char";
+    if (!hit) {
+      // Every >=250 candidate looks like narration — fall back and flag it.
+      hit = after.find(({ b }) => b.chars >= 250);
+      if (hit) {
+        note =
+          "every >=250-char block reads as process narration — the first real " +
+          "answer could not be isolated; TTFA may be off, hand-verify.";
+      }
+    }
+  }
+
+  const ttfaSeconds =
+    hit && qTs ? (hit.b.ts.getTime() - qTs.getTime()) / 1000 : null;
+  return {
+    ttfaSeconds,
+    method,
+    firstAnswerBlockIndex: hit?.i ?? null,
+    firstAnswerChars: hit?.b.chars ?? 0,
+    passesHardGate: ttfaSeconds !== null && ttfaSeconds <= spec.pass_max_seconds,
+    meetsIdeal: ttfaSeconds !== null && ttfaSeconds <= spec.ideal_seconds,
+    note,
+  };
+}
+
+// --- DIGESTIBLE -------------------------------------------------------------
+
+export interface DigestibleScore {
+  lexiconLeakTotal: number;
+  lexiconLeakTerms: Record<string, number>;
+  citationMarkupFirstAnswer: number; // must be 0 (above-the-fold rule)
+  citationMarkupTotal: number;
+  firstAnswerChars: number;
+  answerLeads: boolean;
+  answerLeadsNote?: string;
+}
+
+export function scoreDigestible(
+  view: SessionView,
+  spec: ScoreboardSpec,
+  faster: FasterScore,
+): DigestibleScore {
+  const full = fullOutput(view);
+
+  // Lexicon leak (hard-0 gate): literal jargon terms, case-insensitive, over
+  // the full human-facing output.
+  const terms: Record<string, number> = {};
+  let total = 0;
+  for (const term of spec.lexicon) {
+    const n = countMatches(
+      full,
+      new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"),
+    );
+    if (n > 0) {
+      terms[term] = n;
+      total += n;
+    }
+  }
+
+  // Citation placement: raw markup in the first answer must be 0.
+  const firstAnswer =
+    faster.firstAnswerBlockIndex !== null
+      ? view.assistantBlocks[faster.firstAnswerBlockIndex].text
+      : "";
+  const citationMarkupFirstAnswer = countMatches(firstAnswer, CITATION);
+  const citationMarkupTotal = countMatches(full, CITATION);
+
+  // Answer-leads: the first substantive (non-greeting) assistant block must be
+  // the answer, not process narration.
+  const firstSubstantive = view.assistantBlocks.find(
+    (b) => !GREETING_ONLY.test(b.text.trim()),
+  );
+  const isNarration =
+    !!firstSubstantive && looksLikeNarration(firstSubstantive.text);
+  return {
+    lexiconLeakTotal: total,
+    lexiconLeakTerms: terms,
+    citationMarkupFirstAnswer,
+    citationMarkupTotal,
+    firstAnswerChars: faster.firstAnswerChars,
+    answerLeads: !isNarration,
+    answerLeadsNote: isNarration
+      ? `first emission is process narration: ${JSON.stringify(
+          firstSubstantive!.text.slice(0, 60),
+        )}`
+      : undefined,
+  };
+}
+
+// --- CALIBRATED -------------------------------------------------------------
+
+export interface CalibratedScore {
+  provenanceCount: number; // Obligation A — checkable pointers attached
+  gapsSurfaced: number; // coverage-map proxy (agent-judged quality tail)
+  overclaimMarkers: number; // advisory B-precursor — absolute/superlative phrasing
+  bScored: false;
+  bNote: string;
+}
+
+export function scoreCalibrated(view: SessionView): CalibratedScore {
+  const full = fullOutput(view);
+  return {
+    provenanceCount: countMatches(full, CITATION),
+    gapsSurfaced: countGapMarkers(full),
+    overclaimMarkers: countOverclaimMarkers(full),
+    bScored: false,
+    bNote:
+      "Obligation B (faithful confidence) has an agent-judged tail — not scored " +
+      "deterministically (scoreboard.yaml axes.calibrated.deterministic). " +
+      "RUN_EVAL judge: v1-deferred.",
+  };
+}
+
+// --- combined ---------------------------------------------------------------
+
+export interface SessionScore {
+  sessionId: string;
+  role: Role;
+  questionTurnIndex: number;
+  question: string;
+  faster: FasterScore;
+  digestible: DigestibleScore;
+  calibrated: CalibratedScore;
+}
+
+export function scoreSession(
+  jsonlPath: string,
+  role: Role,
+  opts: { questionTurn?: number; spec?: ScoreboardSpec } = {},
+): SessionScore {
+  const spec = opts.spec ?? loadScoreboard();
+  const view = parseSession(jsonlPath);
+  const qi = questionTurnIndex(view, opts.questionTurn);
+  const faster = scoreFaster(view, role, spec, opts.questionTurn);
+  return {
+    sessionId: view.sessionId,
+    role,
+    questionTurnIndex: qi,
+    question: view.userTurns[qi]?.text ?? "",
+    faster,
+    digestible: scoreDigestible(view, spec, faster),
+    calibrated: scoreCalibrated(view),
+  };
+}
+
+// --- win condition (pair) ---------------------------------------------------
+
+export type AxisVerdict = "tesser-better" | "tie" | "tesser-worse";
+
+export interface PairVerdict {
+  faster: AxisVerdict;
+  digestible: AxisVerdict;
+  calibrated: AxisVerdict;
+  coldTtfaNotWorse: boolean; // the hard gate
+  win: boolean;
+  reasons: string[];
+}
+
+function cmp(tesser: number, def: number, lowerIsBetter: boolean): AxisVerdict {
+  const better = lowerIsBetter ? tesser < def : tesser > def;
+  const worse = lowerIsBetter ? tesser > def : tesser < def;
+  return better ? "tesser-better" : worse ? "tesser-worse" : "tie";
+}
+
+/** Combine sub-checks into one axis verdict: worse if ANY sub-check is worse,
+ *  better if at least one is better and none worse, else tie. */
+function combine(verdicts: AxisVerdict[]): AxisVerdict {
+  if (verdicts.includes("tesser-worse")) return "tesser-worse";
+  if (verdicts.includes("tesser-better")) return "tesser-better";
+  return "tie";
+}
+
+export function scorePair(
+  tesser: SessionScore,
+  def: SessionScore,
+): PairVerdict {
+  const reasons: string[] = [];
+
+  // FASTER: TTFA, lower is better.
+  const fasterV = cmp(
+    tesser.faster.ttfaSeconds ?? Infinity,
+    def.faster.ttfaSeconds ?? Infinity,
+    true,
+  );
+  reasons.push(
+    `faster: tesser ${tesser.faster.ttfaSeconds?.toFixed(1)}s vs default ${def.faster.ttfaSeconds?.toFixed(1)}s → ${fasterV}`,
+  );
+
+  // DIGESTIBLE: lexicon leak, citation-in-first-answer, length, answer-leads.
+  const dV = combine([
+    cmp(tesser.digestible.lexiconLeakTotal, def.digestible.lexiconLeakTotal, true),
+    cmp(
+      tesser.digestible.citationMarkupFirstAnswer,
+      def.digestible.citationMarkupFirstAnswer,
+      true,
+    ),
+    cmp(tesser.digestible.firstAnswerChars, def.digestible.firstAnswerChars, true),
+    cmp(
+      tesser.digestible.answerLeads ? 1 : 0,
+      def.digestible.answerLeads ? 1 : 0,
+      false,
+    ),
+  ]);
+  reasons.push(
+    `digestible: leak ${tesser.digestible.lexiconLeakTotal}/${def.digestible.lexiconLeakTotal}, ` +
+      `cite-in-lead ${tesser.digestible.citationMarkupFirstAnswer}/${def.digestible.citationMarkupFirstAnswer}, ` +
+      `len ${tesser.digestible.firstAnswerChars}/${def.digestible.firstAnswerChars}, ` +
+      `leads ${tesser.digestible.answerLeads}/${def.digestible.answerLeads} → ${dV}`,
+  );
+
+  // CALIBRATED: provenance (A) + gaps surfaced. B is not scored.
+  const cV = combine([
+    cmp(tesser.calibrated.provenanceCount, def.calibrated.provenanceCount, false),
+    cmp(tesser.calibrated.gapsSurfaced, def.calibrated.gapsSurfaced, false),
+  ]);
+  reasons.push(
+    `calibrated: provenance ${tesser.calibrated.provenanceCount}/${def.calibrated.provenanceCount}, ` +
+      `gaps ${tesser.calibrated.gapsSurfaced}/${def.calibrated.gapsSurfaced} → ${cV} (B not scored)`,
+  );
+
+  const axes = [fasterV, dV, cV];
+  const coldTtfaNotWorse = fasterV !== "tesser-worse" && tesser.faster.passesHardGate;
+  const noWorse = !axes.includes("tesser-worse");
+  const someBetter = axes.includes("tesser-better");
+  const win = noWorse && someBetter && coldTtfaNotWorse;
+  if (!coldTtfaNotWorse)
+    reasons.push("HARD GATE: cold TTFA is worse than default or fails the ≤30s bar");
+  return { faster: fasterV, digestible: dV, calibrated: cV, coldTtfaNotWorse, win, reasons };
+}

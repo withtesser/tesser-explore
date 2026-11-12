@@ -1,0 +1,995 @@
+#!/usr/bin/env python3
+"""validate-digest — deterministic digest validator (T8).
+
+Usage: validate-digest <digest.md> [--clone <path-to-clone>] [--persist]
+
+Validates a tesser digest against digest-schema.yaml (the canonical spec,
+read as DATA at runtime from the repo root relative to this script — the
+patterns and enums live there, not here).
+
+With --persist (CC-T7): on a clean validation, atomically move the staged digest
+to its correct location under <state-root>/digests/, computed from the frontmatter
+identity + sha (NOT from where it was staged), first-writer-wins, and print
+{"persisted","digest_sha256","status"} on stdout. The agent never constructs a
+digests/ path or hashes the file itself. The staged-path identity check (rule 3)
+is skipped under --persist since the staged location is temporary.
+
+Checks, in order:
+  1. File parses: UTF-8, YAML frontmatter delimited by --- lines + markdown
+     body.
+  2. Frontmatter required fields present; patterns/enums/shapes enforced.
+  3. Digest path rule (D27/D31): the path ends with
+     <host>/<org-path>/<repo>@<sha12>.md, sha12 == sha[0:12], and the
+     segments are the normalized identity of the frontmatter repo URL.
+  4. Citation grammar v1.1 (D24, tightened by D37): token-totality,
+     suffix-equals-sha, range rule 1 <= Lstart <= Lend, path-normality
+     (repo-relative paths only).
+  5. Clone identity binding (D38), only when --clone is given: when the
+     clone has an origin remote, its normalized identity must equal the
+     frontmatter repo's. A remoteless clone skips with a note.
+  6. Quote-in-range (D18), only when --clone is given: every cited path
+     exists at the frontmatter sha and Lend <= file line count at that sha.
+     Without --clone this check is reported as skipped.
+
+All failures are collected (not fail-fast) and written to stderr, one per
+line. Exit codes: 0 valid, 1 invalid (a property of the digest), 2 usage
+error, 3 PyYAML missing (run scripts/setup), 4 environment failure — git
+missing, digest-schema.yaml unreadable, or a subprocess timeout (D34).
+Persist rule (D34): 0 persist, 1 discard, 4 keep the digest and retry —
+an environment failure says nothing about the digest itself.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import timezone, datetime
+
+
+def _state_root():
+    """TESSER_HOME (tests only) or ~/.tesser/ — same rule as the other
+    scripts."""
+    override = os.environ.get("TESSER_HOME")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".tesser")
+
+
+def _maybe_reexec_into_venv():
+    """D32: dependencies live in the venv created by scripts/setup, not in
+    the system interpreter. Re-exec into the venv python BEFORE the yaml
+    import so a PyYAML-free system python still validates once setup has
+    run. The env marker prevents an exec loop if the venv python resolves
+    unexpectedly."""
+    if os.environ.get("TESSER_VALIDATE_DIGEST_REEXEC") == "1":
+        return
+    venv_python = os.path.join(_state_root(), "venv", "bin", "python3")
+    if not os.access(venv_python, os.X_OK):
+        return  # setup not run: fall through to the import backstop below
+    # Already running inside the venv? Compare prefixes, not executables: the
+    # venv's python3 is a symlink to the interpreter that created it, so a
+    # realpath comparison of the two executables is true even from outside.
+    if os.path.realpath(sys.prefix) == os.path.realpath(os.path.join(_state_root(), "venv")):
+        return
+    os.environ["TESSER_VALIDATE_DIGEST_REEXEC"] = "1"
+    os.execv(venv_python, [venv_python, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+_maybe_reexec_into_venv()
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write(
+        "validate-digest: PyYAML is missing — run scripts/setup once to "
+        "create the venv at ~/.tesser/venv, then re-run\n"
+    )
+    sys.exit(3)
+
+# sha12 length per D27 (filename rule) and the citation grammar's @<sha12>
+# suffix; the value 12 is the definition of "sha12" in digest-schema.yaml.
+SHA12_LEN = 12
+
+# Hard bound on every git subprocess. TESSER_VALIDATE_GIT_TIMEOUT overrides
+# it ONLY so the timeout->exit-4 gate can run in test time; real invocations
+# never set it (same posture as TESSER_HOME). A malformed override falls back
+# to the default rather than crashing at import.
+try:
+    GIT_TIMEOUT = float(os.environ.get("TESSER_VALIDATE_GIT_TIMEOUT") or 30)
+except ValueError:
+    GIT_TIMEOUT = 30.0
+
+# Legitimate digest frontmatter is a few hundred bytes; a multi-KiB block is
+# either malformed or a YAML alias-bomb (safe_load still expands aliases).
+# Cap it before parsing so a crafted digest can't OOM the validator.
+MAX_FRONTMATTER_BYTES = 64 * 1024
+
+CITATION_EXTRACT = re.compile(
+    "⟦([^⟧:]+):L([0-9]+)-L([0-9]+)⟧(?:@([0-9a-f]+))?"
+)
+
+
+def load_schema():
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    schema_path = os.path.join(repo_root, "digest-schema.yaml")
+    with open(schema_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def split_frontmatter(text):
+    """Return (frontmatter_str, body_str) or raise ValueError."""
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("file does not start with a '---' frontmatter delimiter")
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[1:i]), "\n".join(lines[i + 1:])
+    raise ValueError("frontmatter is not closed by a second '---' delimiter")
+
+
+def normalize_identity(repo_url):
+    """Derive the normalized identity (host, segments) per digest-schema.yaml
+    identity rule (D31, amends D28). segments is the FULL namespace path plus
+    the repo name — gitlab.com/group/subgroup/repo keeps all three leading
+    segments, never just the last two. Raises ValueError when no identity is
+    derivable.
+
+    - https://host/path, ssh://git@host/path, scp-style git@host:path all
+      normalize to the same identity
+    - trailing .git stripped from the repo segment; host and every segment
+      lowercased
+    - file://: the host segment is the literal 'file'; org = parent
+      directory name, repo = repository directory name (.git stripped)
+    """
+    url = repo_url.strip()
+
+    def strip_git(s):
+        return s[:-4] if s.endswith(".git") else s
+
+    if url.startswith("file://"):
+        path = url[len("file://"):]
+        path = path.rstrip("/")
+        parts = [p for p in path.split("/") if p]
+        if len(parts) < 2:
+            raise ValueError(
+                f"cannot derive identity from file:// URL {repo_url!r}: "
+                "need at least a parent directory and a repository directory"
+            )
+        org = parts[-2].lower()
+        repo = strip_git(parts[-1]).lower()
+        return "file", [org, repo]
+
+    host = None
+    path = None
+    m = re.match(r"^(https|ssh)://(?:[^/@]+@)?([^/:]+)(?::[0-9]+)?/(.+)$", url)
+    if m:
+        host = m.group(2)
+        path = m.group(3)
+    else:
+        # scp-style: git@host:org/repo
+        m = re.match(r"^[^/@]+@([^/:]+):(.+)$", url)
+        if m:
+            host = m.group(1)
+            path = m.group(2)
+    if host is None:
+        raise ValueError(f"cannot derive identity from repo URL {repo_url!r}")
+
+    parts = [p for p in path.rstrip("/").split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(
+            f"cannot derive identity from repo URL {repo_url!r}: "
+            "need at least one namespace segment and a repo segment"
+        )
+    segments = [p.lower() for p in parts[:-1]] + [strip_git(parts[-1]).lower()]
+    return host.lower(), segments
+
+
+def anchor_kind(fm):
+    """D50: a digest is provider-anchored when `provider` OR `observed_at`
+    appears, else repo-anchored (the default). Determines which anchor pair is
+    required and which validator path (digest-path, persist) applies."""
+    if not isinstance(fm, dict):
+        return "repo"
+    if "provider" in fm or "observed_at" in fm:
+        return "provider"
+    return "repo"
+
+
+def provider_identity(fm):
+    """D50: ('provider', [vendor, ..., service]) from the provider field — the
+    literal host segment 'provider' plus the lowercased path segments. Raises
+    ValueError when no identity is derivable."""
+    provider = fm.get("provider")
+    if not isinstance(provider, str):
+        raise ValueError("provider field is missing or not a string")
+    parts = [p for p in provider.strip("/").split("/") if p]
+    if len(parts) < 2:
+        raise ValueError(
+            f"cannot derive a provider identity from {provider!r}: "
+            "need at least <vendor>/<service>"
+        )
+    return "provider", [p.lower() for p in parts]
+
+
+def observed_date(fm):
+    """D50: the YYYYMMDD digest-path discriminator, derived from observed_at
+    (there is no commit to pin). Accepts a PyYAML datetime or an ISO string.
+    Raises ValueError when observed_at is missing or unparseable."""
+    val = fm.get("observed_at")
+    if isinstance(val, datetime):
+        return val.strftime("%Y%m%d")
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00")).strftime("%Y%m%d")
+        except ValueError:
+            raise ValueError(f"observed_at {val!r} is not a valid ISO-8601 timestamp")
+    raise ValueError("observed_at is missing or not a timestamp")
+
+
+def check_frontmatter(fm, schema, failures):
+    """Validate frontmatter against schema.frontmatter (data-driven), branching
+    on the anchor kind (D50). The `required` block is the repo-anchored default
+    (repo + sha + the always-required fields); a provider-anchored digest
+    replaces repo/sha with provider/observed_at (from provider_anchor) and must
+    set scope: personal + reproducible: false (D52). Returns the dict for
+    downstream checks."""
+    if not isinstance(fm, dict):
+        failures.append("frontmatter: YAML frontmatter must be a mapping")
+        return {}
+
+    fmspec = schema["frontmatter"]
+    required = fmspec["required"]
+    panchor = fmspec.get("provider_anchor", {})
+    repo_anchor_fields = list(panchor.get("forbids", ["repo", "sha"]))
+    provider_anchor_fields = list(panchor.get("requires", ["provider", "observed_at"]))
+    kind = anchor_kind(fm)
+
+    for field, spec in required.items():
+        # On a provider-anchored digest the repo anchor fields are forbidden,
+        # not missing — skip the missing-check here; presence is flagged below.
+        if kind == "provider" and field in repo_anchor_fields:
+            continue
+        if field not in fm:
+            failures.append(f"frontmatter: required field '{field}' is missing")
+            continue
+        check_field(field, fm[field], effective_spec(spec, fm), failures)
+
+    if kind == "provider":
+        for field in repo_anchor_fields:
+            if field in fm:
+                failures.append(
+                    f"frontmatter: '{field}' must be absent on a provider-anchored "
+                    f"digest — provider/observed_at replace repo/sha (D50)"
+                )
+        for field in provider_anchor_fields:
+            if field not in fm:
+                failures.append(
+                    f"frontmatter: provider-anchored digest is missing required "
+                    f"field '{field}' (D50)"
+                )
+                continue
+            check_field(field, fm[field], panchor.get("fields", {}).get(field, {}), failures)
+        enforces = panchor.get("enforces", {})
+        for field, want in enforces.items():
+            if fm.get(field) != want:
+                failures.append(
+                    f"frontmatter: a provider-anchored digest must set "
+                    f"{field}: {want!r} (D52), got {fm.get(field)!r}"
+                )
+    else:
+        for field in provider_anchor_fields:
+            if field in fm:
+                failures.append(
+                    f"frontmatter: '{field}' is only valid on a provider-anchored "
+                    f"digest (D50) — a repo-anchored digest uses repo/sha"
+                )
+
+    optional = fmspec.get("optional", {})
+    for field, spec in optional.items():
+        if field in fm:
+            check_field(field, fm[field], spec, failures)
+
+    return fm
+
+
+def effective_spec(spec, fm):
+    """Apply a declarative `min_items_relaxed_when` from the schema (D8): when
+    another frontmatter field equals a given value, override min_items. Returns the
+    spec unchanged when the condition is absent or unmet, so the strict floor is the
+    default (a missing/invalid truth_grade keeps commands >= 1)."""
+    cond = spec.get("min_items_relaxed_when")
+    if cond and fm.get(cond.get("field")) == cond.get("equals"):
+        relaxed = dict(spec)
+        relaxed["min_items"] = cond.get("min_items", 0)
+        return relaxed
+    return spec
+
+
+def check_field(field, value, spec, failures):
+    ftype = spec.get("type")
+    if ftype == "string":
+        # PyYAML parses unquoted ISO timestamps into datetime objects; accept
+        # both for fields whose format is iso8601-utc, strings otherwise.
+        if spec.get("format") == "iso8601-utc":
+            check_iso8601_utc(field, value, failures)
+            return
+        if not isinstance(value, str):
+            failures.append(
+                f"frontmatter: '{field}' must be a string, got {type(value).__name__}"
+            )
+            return
+        pattern = spec.get("pattern")
+        # fullmatch: re.match + '$' would still accept a trailing newline
+        # (e.g. a block-scalar sha), which would then poison the git show
+        # argument and filename normalization downstream.
+        if pattern and not re.fullmatch(pattern, value):
+            failures.append(
+                f"frontmatter: '{field}' value {value!r} does not match "
+                f"schema pattern {pattern!r}"
+            )
+        enum = spec.get("enum")
+        if enum and value not in enum:
+            failures.append(
+                f"frontmatter: '{field}' value {value!r} not in schema enum {enum}"
+            )
+    elif ftype == "boolean":
+        # D52: reproducible is a YAML bool. PyYAML parses true/false to bool;
+        # anything else (a string "false", an int) is invalid.
+        if not isinstance(value, bool):
+            failures.append(
+                f"frontmatter: '{field}' must be a boolean, got {type(value).__name__}"
+            )
+    elif ftype == "object":
+        if not isinstance(value, dict):
+            failures.append(
+                f"frontmatter: '{field}' must be a mapping, got {type(value).__name__}"
+            )
+            return
+        for key in spec.get("required_keys", []):
+            if key not in value:
+                failures.append(
+                    f"frontmatter: '{field}' is missing required key '{key}'"
+                )
+    elif ftype == "list":
+        if not isinstance(value, list):
+            failures.append(
+                f"frontmatter: '{field}' must be a list, got {type(value).__name__}"
+            )
+            return
+        min_items = spec.get("min_items")
+        if min_items is not None and len(value) < min_items:
+            failures.append(
+                f"frontmatter: '{field}' must have at least {min_items} item(s), "
+                f"got {len(value)}"
+            )
+        item_spec = spec.get("item")
+        if item_spec:
+            type_map = {"string": str, "integer": int}
+            for i, item in enumerate(value):
+                if not isinstance(item, dict):
+                    failures.append(
+                        f"frontmatter: '{field}[{i}]' must be a mapping, "
+                        f"got {type(item).__name__}"
+                    )
+                    continue
+                for key, key_spec in item_spec.items():
+                    if key not in item:
+                        failures.append(
+                            f"frontmatter: '{field}[{i}]' is missing key '{key}'"
+                        )
+                        continue
+                    expected = type_map.get(key_spec.get("type"))
+                    actual = item[key]
+                    # bool is a subclass of int; an exit_code of `true` is invalid
+                    if expected and (
+                        not isinstance(actual, expected) or isinstance(actual, bool)
+                    ):
+                        failures.append(
+                            f"frontmatter: '{field}[{i}].{key}' must be "
+                            f"{key_spec.get('type')}, got {type(actual).__name__}"
+                        )
+
+
+def check_iso8601_utc(field, value, failures):
+    if isinstance(value, datetime):
+        # PyYAML already parsed it; require an explicit UTC offset.
+        if value.tzinfo is None or value.utcoffset() != timezone.utc.utcoffset(None):
+            failures.append(
+                f"frontmatter: '{field}' must be an ISO-8601 UTC timestamp "
+                f"(explicit Z / +00:00 offset), got {value!r}"
+            )
+        return
+    if not isinstance(value, str):
+        failures.append(
+            f"frontmatter: '{field}' must be an ISO-8601 UTC timestamp string, "
+            f"got {type(value).__name__}"
+        )
+        return
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        failures.append(
+            f"frontmatter: '{field}' value {value!r} is not valid ISO-8601"
+        )
+        return
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(None):
+        failures.append(
+            f"frontmatter: '{field}' value {value!r} is not UTC "
+            "(explicit Z / +00:00 offset required)"
+        )
+
+
+def check_provider_digest_path(digest_path, fm, failures):
+    """D50: a provider-anchored digest's path ends with
+    provider/<vendor>/<service>@<YYYYMMDD>.md, where the segments are the
+    provider identity and <YYYYMMDD> is the observation date of observed_at."""
+    try:
+        host, segments = provider_identity(fm)
+        observed = observed_date(fm)
+    except ValueError as e:
+        failures.append(f"digest-path: {e}")
+        return
+    expected_tail = [host] + segments[:-1] + [f"{segments[-1]}@{observed}.md"]
+    actual_parts = os.path.abspath(digest_path).split(os.sep)
+    if actual_parts[-len(expected_tail):] == expected_tail:
+        return
+    expected_rel = "/".join(expected_tail)
+    failures.append(
+        f"digest-path: provider-anchored digest must sit at a path ending "
+        f"'{expected_rel}' (provider/<vendor>/<service>@<YYYYMMDD>.md from the "
+        f"frontmatter provider + observed_at, D50)"
+    )
+
+
+def check_digest_path(digest_path, fm, failures):
+    """Digest path rule (D27/D31): the digest's path ends with
+    <host>/<org-path>/<repo>@<sha12>.md where sha12 == frontmatter sha[0:12]
+    exactly and the segments are the normalized identity of the frontmatter
+    repo URL — a renamed OR re-homed digest is invalid. D50: a provider-anchored
+    digest takes the provider path rule instead."""
+    if anchor_kind(fm) == "provider":
+        check_provider_digest_path(digest_path, fm, failures)
+        return
+    sha = fm.get("sha")
+    repo_url = fm.get("repo")
+    if not isinstance(sha, str) or not isinstance(repo_url, str):
+        return  # missing/mistyped fields already reported in frontmatter checks
+
+    try:
+        host, segments = normalize_identity(repo_url)
+    except ValueError as e:
+        failures.append(f"digest-path: {e}")
+        return
+
+    sha12 = sha[:SHA12_LEN]
+    expected_tail = [host] + segments[:-1] + [f"{segments[-1]}@{sha12}.md"]
+    actual_parts = os.path.abspath(digest_path).split(os.sep)
+    if actual_parts[-len(expected_tail):] == expected_tail:
+        return
+
+    # Mismatch — say which part is wrong when the basename is parseable.
+    basename = os.path.basename(digest_path)
+    expected_rel = "/".join(expected_tail)
+    m = re.match(r"^(.+)@([0-9a-f]+)\.md$", basename)
+    if not m:
+        failures.append(
+            f"digest-path: '{basename}' does not follow <repo>@<sha12>.md; "
+            f"expected a path ending '{expected_rel}' (D27/D31)"
+        )
+        return
+    name_part, name_sha12 = m.group(1), m.group(2)
+    if name_sha12 != sha12:
+        failures.append(
+            f"digest-path: sha12 '{name_sha12}' does not equal frontmatter "
+            f"sha[0:12] '{sha12}' (a renamed digest is invalid, D27)"
+        )
+    actual_dirs = actual_parts[-len(expected_tail):-1]
+    if actual_dirs != expected_tail[:-1] or name_part != segments[-1]:
+        failures.append(
+            f"digest-path: path ending '{'/'.join(actual_dirs + [basename])}' "
+            f"does not match the normalized identity path '{expected_rel}' "
+            f"derived from the frontmatter repo URL (host + full namespace "
+            f"path, D31)"
+        )
+
+
+def check_citations(body, fm, schema, failures):
+    """Citation grammar v1.1 (D24). Returns the list of well-formed citations
+    as (path, lstart, lend) tuples for quote-in-range."""
+    grammar = schema["body"]["citation_grammar"]
+    token_re = re.compile(grammar["token_pattern"])
+    recall_token = grammar.get("recall")  # D8: ⟦recall⟧, exempt from quote-in-range
+    observed_token = grammar.get("observed")  # D51: ⟦observed⟧, likewise exempt
+    sha = fm.get("sha")
+    fm_sha12 = sha[:SHA12_LEN] if isinstance(sha, str) else None
+
+    citations = []
+    open_bracket = "⟦"  # ⟦
+    idx = 0
+    while True:
+        idx = body.find(open_bracket, idx)
+        if idx == -1:
+            break
+        line_no = body.count("\n", 0, idx) + 1
+        m = token_re.match(body, idx)
+        if not m:
+            snippet = body[idx: idx + 60].split("\n")[0]
+            failures.append(
+                f"citation: malformed token at body line {line_no}: "
+                f"'{snippet}' does not fully match the schema token_pattern "
+                "(token-totality, D24)"
+            )
+            idx += 1
+            continue
+
+        token = m.group(0)
+        # D8/D51: the recall and observed provenance markers are valid tokens but
+        # not file citations — no path/line/sha, so nothing to extract and nothing
+        # to quote-in-range.
+        if recall_token is not None and token == recall_token:
+            idx = m.end()
+            continue
+        if observed_token is not None and token == observed_token:
+            idx = m.end()
+            continue
+        # D50/D51 no-laundering: the remaining token is an ordinary file citation
+        # (path:Lstart-Lend[@sha12]). A provider-anchored digest has no clone and
+        # no frontmatter sha, so quote-in-range and suffix-equals-sha are both
+        # inapplicable — the citation would validate with any path/range/suffix,
+        # letting a personal-scope digest carry a source-grounded-LOOKING claim
+        # that nothing checks. Reject it; observed facts use ⟦observed⟧.
+        if anchor_kind(fm) == "provider":
+            failures.append(
+                f"citation: file citation at body line {line_no} is not allowed "
+                f"in a provider-anchored digest — it has no repo/sha to verify "
+                f"against (quote-in-range and suffix-equals-sha are inapplicable); "
+                f"use ⟦observed⟧ for an observed fact (D51)"
+            )
+            idx = m.end()
+            continue
+        ext = CITATION_EXTRACT.match(token)
+        # token_pattern is a strict subset of the extraction regex, so this
+        # always matches; guard anyway.
+        if not ext:
+            failures.append(
+                f"citation: internal error extracting token at body line "
+                f"{line_no}: '{token}'"
+            )
+            idx = m.end()
+            continue
+        path, lstart, lend, suffix = (
+            ext.group(1), int(ext.group(2)), int(ext.group(3)), ext.group(4),
+        )
+
+        # Independent checks — a token violating several rules reports every
+        # violation ("all failures are collected" holds at token granularity).
+        token_ok = True
+        if lstart > lend:
+            token_ok = False
+            failures.append(
+                f"citation: reversed range L{lstart}-L{lend} at body line "
+                f"{line_no} (range rule: 1 <= Lstart <= Lend)"
+            )
+        if fm_sha12 is not None and suffix is not None and suffix != fm_sha12:
+            token_ok = False
+            failures.append(
+                f"citation: explicit suffix @{suffix} at body line {line_no} "
+                f"does not equal frontmatter sha12 @{fm_sha12} "
+                "(suffix-equals-sha, D24)"
+            )
+        # Path-normality (D37): only normal repo-relative paths — traversal,
+        # absolute paths, and '.'/empty segments fail at the grammar stage,
+        # before any git resolution.
+        if path.startswith("/") or any(
+            seg in ("", ".", "..") for seg in path.split("/")
+        ):
+            token_ok = False
+            failures.append(
+                f"citation: path '{path}' at body line {line_no} is not a "
+                "normal repo-relative path (no leading /, no '..' or '.' "
+                "segments, no empty segments — path-normality, D37)"
+            )
+        # The schema charset excludes ⟦ : newlines, but a control char (NUL,
+        # tab) would otherwise pass the grammar and then crash the git
+        # subprocess (embedded-null ValueError). Reject it here as a clean
+        # INVALID rather than a traceback.
+        elif any(ord(ch) < 0x20 for ch in path):
+            token_ok = False
+            failures.append(
+                f"citation: path at body line {line_no} contains a control "
+                "character (path-normality, D37)"
+            )
+        if token_ok:
+            citations.append((path, lstart, lend))
+        idx = m.end()
+
+    return citations
+
+
+def check_quote_in_range(citations, fm, clone, failures, env_failures):
+    """D18: every cited path exists in the clone at the frontmatter sha and
+    every cited Lend <= the file's line count at that sha. git missing and
+    timeouts are environment failures (D34), not properties of the digest."""
+    sha = fm.get("sha")
+    if not isinstance(sha, str):
+        return
+    # The clone not containing the digest's commit (a --depth 1 clone at a
+    # newer head, a gc'd or drift-refreshed clone) is a property of the
+    # CLONE, not the digest (D34): without this guard every citation would
+    # read as "not a file at sha" → exit 1 → the playbook discards a valid
+    # digest. Resolve the commit first; absence is an environment failure.
+    try:
+        head_check = subprocess.run(
+            ["git", "--no-replace-objects", "cat-file", "-e", f"{sha}^{{commit}}"],
+            cwd=clone, capture_output=True, timeout=GIT_TIMEOUT,
+        )
+    except FileNotFoundError:
+        env_failures.append(
+            "quote-in-range: git executable not found on PATH — cannot "
+            "verify citations (environment failure, D34)"
+        )
+        return
+    except subprocess.TimeoutExpired:
+        env_failures.append(
+            f"quote-in-range: git timed out resolving sha {sha[:SHA12_LEN]} "
+            f"({GIT_TIMEOUT:g}s bound; environment failure, D34)"
+        )
+        return
+    if head_check.returncode != 0:
+        env_failures.append(
+            f"quote-in-range: the clone does not contain commit "
+            f"{sha[:SHA12_LEN]} (shallow or drifted clone; environment "
+            "failure, D34 — keep the digest and retry against a clone that "
+            "has the pinned commit)"
+        )
+        return
+    line_counts = {}
+    for path in sorted({c[0] for c in citations}):
+        # `git cat-file blob` (not `git show`): show exits 0 on a TREE and
+        # prints a directory listing, so a citation to a directory would
+        # "validate" against the listing's length. cat-file blob fails on
+        # anything that is not a real file's content. --no-replace-objects:
+        # a malicious clone can plant a refs/replace entry to make citations
+        # resolve against a different tree while naming the victim sha.
+        try:
+            result = subprocess.run(
+                ["git", "--no-replace-objects", "cat-file", "blob", f"{sha}:{path}"],
+                cwd=clone, capture_output=True, timeout=GIT_TIMEOUT,
+            )
+        except FileNotFoundError:
+            env_failures.append(
+                "quote-in-range: git executable not found on PATH — cannot "
+                "verify citations (environment failure, D34)"
+            )
+            return
+        except subprocess.TimeoutExpired:
+            env_failures.append(
+                f"quote-in-range: git timed out reading '{path}' at sha "
+                f"{sha[:SHA12_LEN]} ({GIT_TIMEOUT:g}s bound; environment "
+                "failure, D34)"
+            )
+            line_counts[path] = None
+            continue
+        except ValueError:
+            # Belt-and-suspenders: an embedded NUL in the path reaches argv
+            # as a ValueError. The grammar stage already rejects control
+            # chars; treat any straggler as INVALID, never a traceback.
+            failures.append(
+                f"quote-in-range: cited path '{path!r}' is not a usable git "
+                "path (embedded control character)"
+            )
+            line_counts[path] = None
+            continue
+        if result.returncode != 0:
+            failures.append(
+                f"quote-in-range: cited path '{path}' is not a file in the "
+                f"clone at sha {sha[:SHA12_LEN]} "
+                f"(git cat-file: {result.stderr.decode(errors='replace').strip()})"
+            )
+            line_counts[path] = None
+        else:
+            # Count newline-delimited lines the way Lstart-Lend will actually
+            # be resolved — bytes.splitlines() would also split on \r and
+            # inflate counts for CR-bearing or binary blobs, silently passing
+            # out-of-range citations.
+            content = result.stdout
+            line_counts[path] = content.count(b"\n") + (
+                1 if content and not content.endswith(b"\n") else 0
+            )
+    for path, lstart, lend in citations:
+        count = line_counts.get(path)
+        if count is None:
+            continue
+        if lend > count:
+            failures.append(
+                f"quote-in-range: citation ⟦{path}:L{lstart}-L{lend}⟧ "
+                f"exceeds file length {count} at sha {sha[:SHA12_LEN]}"
+            )
+
+
+def check_clone_identity(fm, clone, failures, env_failures):
+    """D38: when --clone is given and the clone has an origin remote, the
+    remote's normalized identity must equal the frontmatter repo's — any
+    directory with a matching commit must not validate any digest. A
+    remoteless clone (hermetic fixture) skips with a note, as does an origin
+    URL from which no identity is derivable."""
+    repo_url = fm.get("repo")
+    if not isinstance(repo_url, str):
+        return
+    try:
+        fm_identity = normalize_identity(repo_url)
+    except ValueError:
+        return  # already reported by the digest-path check
+    try:
+        result = subprocess.run(
+            ["git", "--no-replace-objects", "remote", "get-url", "origin"],
+            cwd=clone, capture_output=True, timeout=GIT_TIMEOUT,
+        )
+    except FileNotFoundError:
+        env_failures.append(
+            "clone-identity: git executable not found on PATH — cannot "
+            "verify the clone's identity (environment failure, D34)"
+        )
+        return
+    except subprocess.TimeoutExpired:
+        env_failures.append(
+            f"clone-identity: git timed out reading the origin remote "
+            f"({GIT_TIMEOUT:g}s bound; environment failure, D34)"
+        )
+        return
+    if result.returncode != 0:
+        sys.stderr.write(
+            "validate-digest: NOTE: clone has no origin remote — identity "
+            "binding skipped (D38)\n"
+        )
+        return
+    origin_url = result.stdout.decode(errors="replace").strip()
+    try:
+        origin_identity = normalize_identity(origin_url)
+    except ValueError:
+        sys.stderr.write(
+            f"validate-digest: NOTE: no identity derivable from the clone's "
+            f"origin URL {origin_url!r} — identity binding skipped (D38)\n"
+        )
+        return
+    if origin_identity != fm_identity:
+        o_host, o_segs = origin_identity
+        f_host, f_segs = fm_identity
+        failures.append(
+            f"clone-identity: the clone's origin remote {origin_url!r} "
+            f"normalizes to '{o_host}/{'/'.join(o_segs)}' but the "
+            f"frontmatter repo normalizes to '{f_host}/{'/'.join(f_segs)}' "
+            "— the clone is not the digest's library (D38)"
+        )
+
+
+USAGE = "usage: validate-digest <digest.md> [--clone <path-to-clone>] [--persist]\n"
+
+
+def persist_digest(digest_path, fm):
+    """CC-T7: move a VALIDATED staged digest to its correct, computed location
+    under <state-root>/digests/, atomically and first-writer-wins. The target path
+    is derived from the frontmatter identity + sha — NOT from where the agent staged
+    the file — so the agent never constructs a digests/ path (the river/cobra move
+    bug). Returns (target, digest_sha256, status). 'status' is 'persisted' (we moved
+    it) or 'already-present' (a concurrent/earlier run won; left untouched).
+    D50: a provider-anchored digest persists under provider/<vendor>/<service>
+    keyed by the observation date instead of repo identity + sha12."""
+    if anchor_kind(fm) == "provider":
+        host, segments = provider_identity(fm)  # fm already validated as clean
+        disc = observed_date(fm)
+    else:
+        host, segments = normalize_identity(fm["repo"])
+        disc = str(fm["sha"])[:SHA12_LEN]
+    target = os.path.join(
+        _state_root(), "digests", host, *segments[:-1], f"{segments[-1]}@{disc}.md"
+    )
+    if os.path.exists(target):
+        with open(target, "rb") as fh:
+            existing_sha256 = hashlib.sha256(fh.read()).hexdigest()
+        with open(digest_path, "rb") as fh:
+            staged_sha256 = hashlib.sha256(fh.read()).hexdigest()
+        if anchor_kind(fm) == "provider" and staged_sha256 != existing_sha256:
+            # D50 honesty guard: a repo digest's identity@sha is content-addressed,
+            # so a present target is equivalent content and first-writer-wins is
+            # safe. A provider digest's day-granular key (@YYYYMMDD) is NOT — a
+            # same-day re-observation can carry DIFFERENT content and collide here.
+            # Silently keeping the earlier copy and returning ITS hash would make
+            # finalize write a log record that lies about what was saved. Refuse
+            # rather than drop; the staged file is left for the operator to rename.
+            # (Full multiple-observations-per-day support is deferred to the
+            # evidence-bundle rework — docs/claim-cache-design.md.)
+            return target, existing_sha256, "conflict"
+        # First-writer-wins (Codex #11): a present target is the authoritative copy
+        # — repo digests are content-addressed; a provider digest reaching here is
+        # byte-identical (idempotent re-persist). Never clobber.
+        digest_sha256 = existing_sha256
+        status = "already-present"
+    else:
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        # os.replace is an atomic rename within the same filesystem (staged builds/
+        # and digests/ both live under the state root) — the "atomic stage->rename".
+        os.replace(digest_path, target)
+        with open(target, "rb") as fh:
+            digest_sha256 = hashlib.sha256(fh.read()).hexdigest()
+        status = "persisted"
+    return target, digest_sha256, status
+
+
+def main(argv):
+    args = argv[1:]
+    clone = None
+    persist = False
+    positional = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--clone":
+            if i + 1 >= len(args):
+                sys.stderr.write(USAGE)
+                return 2
+            clone = args[i + 1]
+            i += 2
+        elif args[i] == "--persist":
+            persist = True
+            i += 1
+        elif args[i].startswith("-"):
+            sys.stderr.write(f"validate-digest: unknown option {args[i]!r}\n")
+            sys.stderr.write(USAGE)
+            return 2
+        else:
+            positional.append(args[i])
+            i += 1
+    if len(positional) != 1:
+        sys.stderr.write(USAGE)
+        return 2
+    digest_path = positional[0]
+    if not os.path.isfile(digest_path):
+        sys.stderr.write(f"validate-digest: no such file: {digest_path}\n")
+        return 2
+    if clone is not None and not os.path.isdir(clone):
+        sys.stderr.write(f"validate-digest: --clone path is not a directory: {clone}\n")
+        return 2
+
+    # The schema is the skill's own data file: unreadable or unparseable
+    # means a broken environment, not an invalid digest (D34).
+    try:
+        schema = load_schema()
+    except (OSError, yaml.YAMLError) as e:
+        sys.stderr.write(
+            f"ENVIRONMENT: cannot load digest-schema.yaml: {e}\n"
+            "validate-digest: environment failure — repair the skill "
+            "checkout and retry (D34)\n"
+        )
+        return 4
+
+    failures = []
+    env_failures = []
+
+    # 1. Parse: UTF-8 (utf-8-sig tolerates a BOM so a BOM-emitting editor's
+    # digest fails on its real defects, not a misleading "no --- delimiter"),
+    # then frontmatter + body. A non-UTF-8 digest is a property of the digest
+    # — INVALID, not an environment failure (D34).
+    try:
+        with open(digest_path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except UnicodeDecodeError as e:
+        failures.append(f"parse: digest is not valid UTF-8: {e}")
+        report(failures, env_failures)
+        return 1
+    try:
+        fm_str, body = split_frontmatter(text)
+    except ValueError as e:
+        failures.append(f"parse: {e}")
+        report(failures, env_failures)
+        return 1
+    if len(fm_str.encode("utf-8")) > MAX_FRONTMATTER_BYTES:
+        failures.append(
+            f"parse: frontmatter exceeds {MAX_FRONTMATTER_BYTES} bytes — "
+            "malformed or an alias-bomb; rejected before parsing"
+        )
+        report(failures, env_failures)
+        return 1
+    try:
+        fm = yaml.safe_load(fm_str)
+    except yaml.YAMLError as e:
+        failures.append(f"parse: frontmatter is not valid YAML: {e}")
+        report(failures, env_failures)
+        return 1
+
+    # 2. Frontmatter fields
+    fm = check_frontmatter(fm, schema, failures)
+
+    # 3. Digest path rule — validates that an IN-PLACE digest sits at its identity
+    # path. Skipped under --persist: there the staged location is temporary and the
+    # script computes the correct target by construction, so checking the staged
+    # path would just re-impose the error-prone hand-built-path step (CC-T7).
+    if not persist:
+        check_digest_path(digest_path, fm, failures)
+
+    # 4. Citation grammar v1.1
+    citations = check_citations(body, fm, schema, failures)
+
+    # D51: a run-grade provider-anchored digest must carry >=1 ⟦observed⟧ claim —
+    # a run-grade label with no observation is the overclaim the marker guards.
+    panchor = schema["frontmatter"].get("provider_anchor", {})
+    if (
+        anchor_kind(fm) == "provider"
+        and panchor.get("run_grade_requires_observed")
+        and isinstance(fm, dict)
+        and fm.get("truth_grade") == "run"
+    ):
+        observed_token = schema["body"]["citation_grammar"].get("observed", "⟦observed⟧")
+        if observed_token not in body:
+            failures.append(
+                "citation: a run-grade provider-anchored digest must carry at "
+                "least one ⟦observed⟧ claim (D51) — a run-grade label with no "
+                "observation is an overclaim"
+            )
+
+    # 5 + 6. Clone identity binding and quote-in-range (only with --clone).
+    # D50: both are repo-specific (origin remote, sha:path), so they are
+    # inapplicable to a provider-anchored digest — skipped by kind, not by error.
+    if clone is not None and anchor_kind(fm) == "provider":
+        sys.stderr.write(
+            "validate-digest: NOTE: clone-identity and quote-in-range are "
+            "inapplicable to a provider-anchored digest (no repo/sha, D50)\n"
+        )
+    elif clone is not None:
+        check_clone_identity(fm, clone, failures, env_failures)
+        check_quote_in_range(citations, fm, clone, failures, env_failures)
+    else:
+        sys.stderr.write(
+            "validate-digest: NOTE: clone-identity and quote-in-range checks "
+            "skipped (no --clone given)\n"
+        )
+
+    report(failures, env_failures)
+    # A confirmed INVALID finding wins over an environment failure: the
+    # digest is provably bad regardless of the environment. Exit 4 only when
+    # the environment kept an otherwise-clean digest from full validation.
+    if failures:
+        return 1
+    if env_failures:
+        return 4
+    # Validation passed. Under --persist, the script owns the move to digests/
+    # (CC-T7): it computes the correct path and atomically renames, so the agent
+    # never constructs a digests/ path and gets digest_sha256 for free (no manual
+    # hashing). A move failure is an environment problem, not a bad digest (D34).
+    if persist:
+        try:
+            target, digest_sha256, status = persist_digest(digest_path, fm)
+        except (ValueError, OSError) as e:
+            sys.stderr.write(f"ENVIRONMENT: persist failed: {e}\n")
+            return 4
+        if status == "conflict":
+            # A different provider observation already occupies this day-key. This
+            # is not an environment failure and not a malformed digest — it is a
+            # refusal to overwrite non-equivalent content under a non-content-
+            # addressed key (D50). Exit 1 so finalize aborts and never writes a log
+            # record pointing at the earlier, different digest.
+            sys.stderr.write(
+                f"INVALID: a different observation already exists at {target} for "
+                f"this provider on the same day — refusing to overwrite (the "
+                f"provider day-key is not content-addressed, D50). Not persisted; "
+                f"the earlier digest stands and the staged file is untouched.\n"
+            )
+            return 1
+        sys.stdout.write(json.dumps({
+            "persisted": target,
+            "digest_sha256": digest_sha256,
+            "status": status,
+        }, ensure_ascii=False) + "\n")
+    return 0
+
+
+def report(failures, env_failures):
+    for failure in failures:
+        sys.stderr.write(f"INVALID: {failure}\n")
+    for failure in env_failures:
+        sys.stderr.write(f"ENVIRONMENT: {failure}\n")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

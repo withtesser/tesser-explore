@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""tesser invocation logger (T3).
+
+Implements the record spec pinned as data in log-schema.yaml (D21). Appends
+`opened` / `finalized` event lines to the invocation log, one JSON object per
+line, append-only: the file is only ever opened in append mode, never
+read-modify-written, never truncated. A finalize is a second line sharing the
+open's id, not an update. The logger NEVER force-finalizes an opened record —
+the only code path that emits a `finalized` line is an explicit `finalize`
+call (walk-away semantics, D21).
+
+State root: ~/.tesser/ (log at <root>/log.jsonl, first-run marker at
+<root>/first-run). The TESSER_HOME environment variable overrides the root —
+it exists ONLY so tests can run hermetically against a temp directory; real
+invocations never set it.
+
+invocation_source is DERIVED, never an argument (D6/6A): marker absent means
+"seeded" (and the marker is created); marker present means "self". The marker
+is never deleted or rewritten by tesser.
+
+Usage:
+  log-invocation open --question <text> [--repo <url>]
+      Appends an opened event; prints the new record id to stdout.
+  log-invocation finalize --id <uuid> --outcome <value> [--repo <url>]
+      [--sha <40hex>] [--dependency-kind <slug>]
+      [--failing-command <cmd> --exit-code <int>] [--digest <path>]
+      [--digest-sha256 <64hex>]
+      Appends a finalized event with exactly the fields supplied.
+      --sha is REQUIRED when --outcome is completed (D33: a completed run by
+      definition pinned a commit); for completed-unverified it is optional —
+      presence means a pin happened. --digest-sha256 is the SHA-256 of a
+      digest persisted or served, passive evidence only (D35/D10): the
+      logger records it, nothing verifies it.
+
+Any malformed or invalid argument exits nonzero with a message on stderr and
+appends nothing.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, timezone
+
+# Enums and patterns mirror log-schema.yaml (the source of truth — D21).
+# Keep them in sync only via a matching build-contract decision.
+OUTCOMES = ("completed", "completed-unverified", "install-failure", "aborted")
+DEPENDENCY_KINDS = (
+    "clonable-cli",
+    "clonable-library",
+    "sdk-of-hosted-service",
+    "hosted-closed",
+    "heavy-infra",
+)
+SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+DIGEST_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# D50: provider identity <vendor>/<service> for a provider-anchored finalize
+# (mirrors digest-schema.yaml provider_anchor.fields.provider).
+PROVIDER_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]*(/[a-z0-9][a-z0-9._-]*)+$")
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+LOG_NAME = "log.jsonl"
+MARKER_NAME = "first-run"
+
+
+def state_root() -> str:
+    """Resolve the state root: TESSER_HOME (tests only) or ~/.tesser/."""
+    override = os.environ.get("TESSER_HOME")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".tesser")
+
+
+def utc_now_iso() -> str:
+    """ISO-8601 UTC timestamp with a Z suffix."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def fail(message: str) -> "None":
+    print(f"log-invocation: error: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def append_line(root: str, record: dict) -> None:
+    """Append one JSON object as one line. Append mode only — never
+    read-modify-write, never truncate. The line is emitted as a single
+    os.write on an O_APPEND fd so concurrent invocations cannot interleave
+    bytes mid-line. The log may hold questions, repo URLs, and local paths,
+    so the state dir is 0700 and the log 0600."""
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False, separators=(", ", ": "))
+    fd = os.open(
+        os.path.join(root, LOG_NAME),
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        0o600,
+    )
+    try:
+        os.write(fd, (line + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def create_marker(root: str, ts: str) -> None:
+    """Create the first-run marker (ISO-8601 UTC ts, newline-terminated).
+    O_EXCL guarantees an existing marker is never rewritten (and refuses to
+    follow a pre-placed symlink). A concurrent first invocation losing this
+    race is fine: both runs already logged, exactly one marker exists."""
+    marker_path = os.path.join(root, MARKER_NAME)
+    try:
+        fd = os.open(marker_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    try:
+        os.write(fd, (ts + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def cmd_open(args: argparse.Namespace) -> None:
+    root = state_root()
+    ts = utc_now_iso()
+    record_id = str(uuid.uuid4())
+    # Derive seeded/self from marker EXISTENCE only (D6/6A); the marker is
+    # created after a successful append so a failed append (disk full,
+    # unwritable root) cannot consume the one-and-only seeded attribution
+    # without a seeded record existing in the log.
+    is_first = not os.path.exists(os.path.join(root, MARKER_NAME))
+    record = {
+        "id": record_id,
+        "event": "opened",
+        "ts": ts,
+        "question": args.question,
+        "invocation_source": "seeded" if is_first else "self",
+    }
+    if args.repo is not None:
+        record["repo"] = args.repo
+    append_line(root, record)
+    if is_first:
+        create_marker(root, ts)
+    print(record_id)
+
+
+def cmd_finalize(args: argparse.Namespace) -> None:
+    # Validate everything BEFORE building/appending the record: an invalid
+    # finalize must append zero bytes.
+    if not UUID_PATTERN.match(args.id):
+        fail(f"--id must be a canonical lowercase UUID, got {args.id!r}")
+    if args.outcome not in OUTCOMES:
+        fail(
+            f"--outcome must be one of {', '.join(OUTCOMES)} "
+            f"(log-schema.yaml outcome enum), got {args.outcome!r}"
+        )
+    if args.sha is not None and not SHA_PATTERN.match(args.sha):
+        fail(f"--sha must match ^[0-9a-f]{{40}}$, got {args.sha!r}")
+    # D50: a provider-anchored finalize (--provider) has no clone URL and no
+    # commit. repo+provider on one finalize is two anchors — reject it.
+    if args.provider is not None and not PROVIDER_PATTERN.match(args.provider):
+        fail(
+            f"--provider must match ^[a-z0-9][a-z0-9.-]*(/[a-z0-9][a-z0-9._-]*)+$ "
+            f"(<vendor>/<service>, D50), got {args.provider!r}"
+        )
+    if args.provider is not None and args.repo is not None:
+        fail("--provider and --repo are mutually exclusive (one anchor per finalize, D50)")
+    if args.provider is not None and args.sha is not None:
+        fail("--provider and --sha are mutually exclusive (a provider run has no commit, D50)")
+    # D33: a completed run by definition pinned a commit — the logger gates
+    # it. completed-unverified legitimately has no sha (e.g. a docs-grade
+    # answer after a failed clone); there, presence means a pin happened.
+    # D50 exemption: a provider-anchored completed run has no commit to pin.
+    if args.outcome == "completed" and args.sha is None and args.provider is None:
+        fail("--sha is required when --outcome is completed (D33)")
+    if args.digest_sha256 is not None and not DIGEST_SHA256_PATTERN.match(
+        args.digest_sha256
+    ):
+        fail(
+            f"--digest-sha256 must match ^[0-9a-f]{{64}}$, "
+            f"got {args.digest_sha256!r}"
+        )
+    if args.dependency_kind is not None and args.dependency_kind not in DEPENDENCY_KINDS:
+        fail(
+            f"--dependency-kind must be one of {', '.join(DEPENDENCY_KINDS)} "
+            f"(log-schema.yaml dependency_kind enum), got {args.dependency_kind!r}"
+        )
+    if (args.failing_command is None) != (args.exit_code is None):
+        fail("--failing-command and --exit-code are required together")
+    if args.digest is not None and not os.path.exists(args.digest):
+        fail(f"--digest path does not exist: {args.digest!r} (D14)")
+    # D35: a served digest is logged WITH its hash — the contract's
+    # digest-consult clause couples them. Hash-only (persist, no serve) is
+    # fine; path-only is not.
+    if args.digest is not None and args.digest_sha256 is None:
+        fail("--digest requires --digest-sha256 (a served digest logs its hash, D35)")
+
+    record = {
+        "id": args.id,
+        "event": "finalized",
+        "ts": utc_now_iso(),
+    }
+    if args.repo is not None:
+        record["repo"] = args.repo
+    if args.provider is not None:
+        record["provider"] = args.provider
+    if args.credentialed:
+        record["credentialed"] = True
+    if args.sha is not None:
+        record["sha"] = args.sha
+    if args.dependency_kind is not None:
+        record["dependency_kind"] = args.dependency_kind
+    record["outcome"] = args.outcome
+    if args.failing_command is not None:
+        record["failing_command"] = args.failing_command
+        record["exit_code"] = args.exit_code
+    if args.digest is not None:
+        record["consulted_cached_digest"] = args.digest
+    if args.digest_sha256 is not None:
+        record["digest_sha256"] = args.digest_sha256
+    append_line(state_root(), record)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="log-invocation",
+        description="Append tesser invocation-log events (log-schema.yaml, D21).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_open = sub.add_parser("open", help="append an opened event; print its id")
+    p_open.add_argument("--question", required=True, help="the developer's question, verbatim")
+    p_open.add_argument("--repo", help="resolved canonical clone URL, if already known")
+    p_open.set_defaults(func=cmd_open)
+
+    p_fin = sub.add_parser("finalize", help="append a finalized event")
+    p_fin.add_argument("--id", required=True, help="id printed by the matching open")
+    p_fin.add_argument("--outcome", required=True, help=f"one of: {', '.join(OUTCOMES)}")
+    p_fin.add_argument("--repo", help="resolved canonical clone URL")
+    p_fin.add_argument(
+        "--provider",
+        help="provider identity <vendor>/<service> for a provider-anchored run (D50; mutually exclusive with --repo/--sha)",
+    )
+    p_fin.add_argument(
+        "--credentialed",
+        action="store_true",
+        help="passive marker that this run used developer-supplied credentials (D49)",
+    )
+    p_fin.add_argument("--sha", help="pinned 40-hex commit SHA")
+    p_fin.add_argument(
+        "--dependency-kind",
+        dest="dependency_kind",
+        help=f"one of: {', '.join(DEPENDENCY_KINDS)}",
+    )
+    p_fin.add_argument("--failing-command", dest="failing_command", help="the command that failed")
+    p_fin.add_argument("--exit-code", dest="exit_code", type=int, help="exit code of the failing command")
+    p_fin.add_argument(
+        "--digest",
+        help="path of the cached digest served (logged as consulted_cached_digest)",
+    )
+    p_fin.add_argument(
+        "--digest-sha256",
+        dest="digest_sha256",
+        help="SHA-256 of a digest persisted or served (passive evidence, D35/D10)",
+    )
+    p_fin.set_defaults(func=cmd_finalize)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

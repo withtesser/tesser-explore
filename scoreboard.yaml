@@ -1,0 +1,253 @@
+# tesser experience scoreboard — spec-as-data (D39, truth axis reframed D40)
+#
+# WHAT THIS IS
+# The measurement contract for whether tesser delivers a better EXPERIENCE than
+# the developer's default agent. Maintainer's framing (2026-06-11 evening course-
+# correction, verbatim): "What is the experience we're trying to deliver to devs?
+# Fast(er) truth. And I should probably say truth(er) too. ... It takes longer,
+# the output is essentially non-digestible for a human, and did it actually
+# improve on truthiness?" Three axes fall out: FASTER, CALIBRATED, DIGESTIBLE.
+# (The truth axis was named TRUER, then reframed + renamed CALIBRATED on
+# 2026-06-12 — D40: v1 scopes to "convey how true" / calibration; "make it true"
+# / run-grade-verified correctness defers to v2. See axes.calibrated.)
+#
+# WHY IT EXISTS
+# The 109 deterministic gates that already exist test whether an agent OBEYS
+# SKILL.md — they cannot tell us whether the result beats the default. That is
+# the "measurement trap": a skill that follows our instructions perfectly and
+# still delivers a worse experience. This file defines the outcome-anchored
+# scoreboard the obedience gates can't. Eval/e2e (T6/T7) will pin against it.
+#
+# THE BASELINE (load-bearing)
+# The developer's DEFAULT agent (no tesser skill installed) is the NULL BASELINE.
+# This is the gs-structure-skill-test "need-it" gate applied to tesser: for any
+# (dependency x question) cell the default already clears, tesser does not get to
+# justify itself there. tesser must CLEAR the default per cell, across the FULL
+# dependency range INCLUDING simple, well-documented, low-consequence deps
+# (maintainer: "we need to be able handle simple, less-consequential dependencies
+# better than the default"). Narrowing to a deep-docs-fail wedge was REJECTED.
+#
+# STATUS: draft v1. Locked as the working contract 2026-06-11. A revision pass is
+# pre-committed: the maintainer will dogfood the tool a few times, then we revise
+# against what actually works. The three open_decisions below are not blockers.
+#
+# PRIOR ART PULLED (see references: at bottom)
+#  - gs-structure-skill-test: the null/existing "need-it" gate; deterministic
+#    A/B structure pins (structure.test.ts), incl. provisional-marker hygiene;
+#    the runSkillTurns(--session-id/--resume) harness; the headless-commits-to-
+#    main footgun (isolate writes, --disallowedTools).
+#  - agent-overclaiming RCA: structural-over-dispositional (a required output
+#    FIELD can't be deprioritized like an instruction); caught-errors-are-a-
+#    biased-sample (we can only measure CATCHABLE wrongness).
+
+version: 1
+status: draft
+locked_at: "2026-06-11"
+revised_at: "2026-06-12"   # folded in: 2 of 3 opens settled from 5 scored cells + the private-repo run-grade-cap finding.
+revision_trigger: "maintainer dogfoods the tool a few times, then revise against observed reality"
+
+baseline:
+  who: "the developer's default agent, no tesser skill installed (bare)"
+  doctrine: "null/existing 'need-it' gate (gs-structure-skill-test) — default is what tesser must beat"
+  scope: "full dependency range, including simple/well-documented/low-consequence deps"
+  rejected_alternative: "narrowing the target to a 'best non-clone authority fails' wedge — maintainer rejected; simple deps must win too"
+  comparison_protocol: "same question, same dependency, same machine + model; tesser run and default run scored on every axis; report per-cell, never averaged across cells (the winning axis shifts with dependency kind)"
+
+axes:
+
+  # ---------------------------------------------------------------------------
+  faster:
+    id: ttfa
+    name: "Time To First Answer"
+    model: "UX time-to-first-render (TTFR), not time-to-complete"
+    definition: >
+      Wall-clock from the question to the first SUBSTANTIVE answer — a real
+      one-liner / short paragraph / <=3 bullets that answers what was asked.
+      An acknowledgment ("I'm researching...", "working on it") does NOT stop
+      the clock. The LLM default tries to be complete every time; tesser must
+      not. The first emission answers now, then offers to go deeper.
+    first_answer_shape:                 # tesser's required first emission (also makes TTFA deterministically detectable)
+      - "a direct concise answer to the asked question (one-liner / paragraph / <=3 bullets)"
+      - "then a deepening-in-progress + invite-follow-ups line: 'I'm pulling more so I can X — tell me your follow-ups'"
+    beat1_source:                       # D47 (2026-06-15): where beat-1's SUBSTANCE comes from — readme-first contract
+      known_dep: "answer immediately from the model's own knowledge, calibrated (sure-of vs only-recalling)"
+      unknown_dep: "a fast SHA-pinned README/description fetch (no clone) grounds a real docs-grade beat-1 answer in seconds. A holding line ('I don't recognize this, reading the source now, sit tight') is NOT a beat-1 answer — it is the acknowledgment the definition says does NOT stop the clock, so TTFA runs to the superseding answer and the hard gate fails (reproduced: 33s holding line, true first answer 163s)."
+    gate: hard
+    bar:
+      ideal_seconds: 10
+      pass_max_seconds: 30
+    t_final: "uncapped; only runs when the user opts to deepen. cold t_first is the gate, not t_final."
+    deterministic: true
+    measurement_source: "session transcript timestamps (JSONL)"
+    baseline_rule:                      # SETTLED 2026-06-12 from 5 scored cells (ttfa_baseline_rule, was open)
+      default: "first assistant text block >= 250 chars. Measured cleanly: default preambles ('I'll research the Coral repo...') ran 90-135 chars; real answers 2900+ chars. No overlap."
+      tesser: "MUST emit a structurally-detectable first-answer marker — the >=250-char rule MISFIRES on tesser (its process-narration blocks exceed 250 and are not answers; e.g. private-repo-cold's first >=250 block at 107.6s was 'Cold run — no digest, no clone. Preflight/classif...', pure machinery). The marker also makes the answer_leads check trivial."
+      note: "the rule is asymmetric by necessity; this asymmetry is a real design requirement on tesser, not a measurement convenience."
+
+  # ---------------------------------------------------------------------------
+  calibrated:                           # RENAMED from 'truer' + REFRAMED 2026-06-12 (D40). v1 = JTBD #2; #1 deferred to v2.
+    id: calibration
+    name: "Calibrated — convey how true, never overclaim"
+    scope_decision: >
+      v1 scopes to JTBD #2 (convey how true a claim is) and DEFERS JTBD #1
+      (make/verify the claim true — run-grade-verified correctness) to v2. This
+      is Chris's already-locked decision in trust-a-claim-as-much-as-it-deserves
+      (2026-06-07), inherited here. Why: #2 makes being wrong SAFE (a wrong claim
+      only burns the dev if handed over as confident); #2 is cheap and bounded,
+      #1 is expensive and infinite (the unknown-unknowns hole); and #1 is exactly
+      what the host auto-mode wall blocks (private-repo: run-grade denied, the
+      answer unchanged — the differentiator was a no-op), so #1 pairs naturally
+      with the v2 sandboxing/hosted tier that would unblock it.
+    definition: >
+      The answer conveys how true it is, faithfully, in BOTH directions — never
+      claiming more certainty than the evidence licenses, never less. Formally
+      (findings-are-max-entropy-distributions): overstatement = claiming a
+      distribution with LESS entropy than your evidence supports. So a confident
+      3k-char dump is a formal overstatement, and a 3-bullet answer that flags
+      its gaps is the honest max-entropy distribution — a SHORTER answer can
+      score HIGHER on this axis than a longer one (the maintainer's exact point).
+    obligations:                        # both Chris-locked in trust-a-claim
+      A_provenance: "each load-bearing claim carries CHECKABLE provenance attached when stated — a pointer someone can verify, not a narrated story — at the grade actually reached (run > inspect > docs)."
+      B_faithful_confidence: "conveyed confidence never over- nor understates, and never conceals its own blind spot."
+    coverage_map:                       # the knowns / known-unknowns / unknown-unknowns the answer must surface
+      covered: "what was consulted, and the grade reached"
+      known_gap: "named, WITH a pointer — e.g. 'the LLM loop needs a Gemini key + Postgres I could not reach'; 'authoritative docs exist I did not read'"
+      unknown_gap: "the residual blind spot — flag its EXISTENCE (always knowable), never fake its SIZE (never knowable); do NOT chase it (chasing is a #1 move)."
+    bar:
+      no_overclaim: "no load-bearing claim stated at higher certainty/grade than its provenance warrants"
+      no_underclaim: "no faithful claim hedged below its warrant (the 'trustworthy but useless' failure — miscalibration too)"
+      gaps_surfaced: "known gaps named with pointers; unknown-gap residue flagged, not chased"
+      provenance_attached: "every load-bearing claim has a checkable pointer at its actual grade"
+    verification_contract:                # D48 (2026-06-15) — Obligation B at does-it-work / make-it-work altitude. ADVISORY (agent-judged) until calibrated on Chris-labeled scenarios.
+      scope: "applies ONLY when the answer asserts a result works / does not work (does-it-work / make-it-work); never to an overview / what-is-it answer (there it is N/A, not a miss)."
+      rule: >
+        A result claim must ship the verification contract: (a) the ground-truth
+        signal to check, (b) the misleading proxies and WHY they lie — false-positive
+        (HTTP 200 / exit 0 = 'dispatched', not 'worked') and false-negative (a status
+        log that never updates even on success), (c) an honest agent-observable vs
+        dev-only split, (d) on delegation, the COMPLETE 'watch X, distrust Y because
+        it lies' instruction.
+      failure_mode: >
+        the HALF-CONTRACT — a positive signal with no distrust warning for a proxy
+        that will mislead. One session: 'watch the setpoint' was given but
+        'ignore the activity log, it won't move even on success' was omitted for
+        ~40 min, so the dev chased a phantom (the call had worked the whole time).
+      status: advisory                    # n=1. Promote to load-bearing once `npm run judge` replicates Chris on >=5 labeled make-it-work scenarios (the lying-signals catalog: false-pos HTTP200/exit0/job-id, false-neg ran-not-attributed, delayed cache/async).
+      deferred_to_v2: "the corollary that the AGENT runs its own degraded self-check BEFORE delegating is actually-verify (#1) — deferred with the run/sandbox tier, same line as the rest of #1."
+    observed_provenance:                  # D51/D52 (2026-06-25) — provenance + reproducibility honesty for hosted-service runs. ADVISORY.
+      scope: "applies when the answer reports facts established by OPERATING a live hosted/credentialed service (provider-anchored, ⟦observed⟧)."
+      rule: >
+        Obligation A extends to a third provenance surface: a fact learned by
+        operating a live service is ⟦observed⟧ — checkable as "I ran it and saw
+        X", never laundered as source-grounded (a repo line) or recall (training).
+        Obligation B adds a reproducibility caveat: observed facts are
+        account-specific and time-specific, so the answer flags them as not
+        reproducible ("true of your account when I ran it"), never as documented
+        behavior.
+      failure_mode: >
+        provenance-laundering — stating an observed fact as if a repo's source or
+        the vendor's docs established it (the firecracker-shoehorn: filing
+        AWS-Lambda-microVM behavior under the OSS firecracker repo). And
+        overclaiming reproducibility — presenting an account-specific observation
+        as a general guarantee.
+      status: advisory                    # encode-from-retro; promote once judged on labeled hosted-service sessions.
+    edge_over_default: >
+      The bare agent flags gaps ad-hoc (private-repo: it caught the placeholder/
+      forward-dated model IDs, Python-only validation, and the `git add -A` blast
+      radius) but with NO grades and NO pinned provenance. tesser's calibration
+      edge is doing A+B SYSTEMATICALLY — and unlike the run-grade edge, it
+      survives auto-mode (needs no execution of untrusted code).
+    deferred_to_v2:
+      job: "JTBD #1 — make/verify the claim true: the per-claim correctness truth-delta vs an EXECUTION oracle (run > inspect > docs adjudicated by running the code at a pinned SHA; authority-misattribution: docs never adjudicate)."
+      why: "expensive + infinite (unknown-unknowns), and policy-walled for untrusted external clones in the common posture until sandboxing / a hosted tier lands."
+      oracle_note: "the scoreboard's OFFLINE oracle may still adjudicate #1 for our own eval reference (the maintainer's scored results keep the 2026-06-11 red-team verdicts), but tesser-IN-PRODUCTION does not claim run-grade-correctness in v1."
+      biased_sample_caveat: "and #1 correctness can only ever measure CATCHABLE wrongness (agent-overclaiming RCA / caught-errors-are-a-biased-sample) — another reason #2 is the honest v1 target."
+    deterministic: "A (provenance attached + the pointer resolves) and the coverage-map buckets are structurally checkable; B's faithfulness has an agent-judged tail — certify the checker against a Chris-judged sample, then close the loop against outcomes (trust-a-claim)."
+    prototype: "the 2026-06-11 evening red-team scored #1 (confirmed/wrong); the v1 metric is A+B. Reuse its claim-extraction, swap the verdict to {overclaimed / faithful / underclaimed} + {provenance-attached?} + {gaps-surfaced?}."
+
+  # ---------------------------------------------------------------------------
+  digestible:
+    id: structure
+    name: "Digestibility — structural only (signal-to-noise)"
+    definition: >
+      Deterministic A/B pins on the SHAPE of the human-facing output. NO
+      functional-extraction test and NO completeness/answeredness scoring:
+      those assume what the function of the response is, which we must not bake
+      in (maintainer). Structure only.
+    priority: >                         # REORDERED 2026-06-12 from data: raw citation-ratio understated the problem ~10x
+      Weight the checks in this order — (1) no_internal_lexicon_leak [hard 0],
+      (2) answer_leads, (3) length_vs_default, (4) citation placement. Measured
+      basis: current tesser leaked 18 internal terms on pyyaml / 12 on
+      private-repo-cold and led with process narration, while its citation-noise
+      RATIO was only ~0.04 (default 0.000). The lexicon + narration + 3-5x
+      length are the digestibility killers; the raw ratio is a weak signal.
+    checks:
+      no_internal_lexicon_leak:
+        rule: "the human-facing output must contain NONE of the forbidden internal-impl terms"
+        forbidden_lexicon:             # FINAL (D41, 2026-06-12) — was forbidden_lexicon_seed; doubles as tesser's output writing-style contract. Tests pin against this list (scorer + SKILL.md sync gate).
+          - "run-grade"
+          - "inspect-grade"            # + D41: the full grade ladder is internal vocabulary
+          - "docs-grade"               # + D41
+          - "truth-grade"
+          - "citable knowledge"
+          - "cold run"
+          - "digest"
+          - "provisional"
+          - "kind slug"
+          - "drift check"               # + D42 (2026-06-13): the async-grounding term is meaningless to the developer ("I don't even know what drift check is" — Chris dogfood). The check stays silent on success; the word never reaches the dev.
+          - "sleuth"                    # + D43 (2026-06-13): the conc dogfood leaked tesser's internal name for the background grounding subagent ("the sleuth is confirming against source now"). The mechanic is invisible; its name never reaches the dev.
+          # "the skill" REMOVED (D41 amendment, 2026-06-13): too generic — it
+          # false-positives on plain English (a default-agent answer said "the
+          # skill" of a dependency and scored a spurious leak). `tesser` already
+          # catches the real offender, "the tesser skill".
+          - raw "⟦...⟧@sha" citation markup shown to a human   # handled by the citation-markup regex, not literal match
+        deterministic: true
+      citation_placement:               # SETTLED 2026-06-12 (was noise_ratio_ceiling, open) — placement rule, not a global ratio
+        rule: "ZERO raw ⟦...⟧@sha citation markup above the fold / in the first answer. Citations live in an appendix or are revealed on demand. A global ratio threshold was rejected: measured tesser ratio was only ~0.04 and still felt non-digestible, because placement (citations in the lead) not ratio is what hurts."
+        measured: "default = 0.000 citation markup across all 5 cells; current tesser = 0.024-0.044, in-line."
+        deterministic: true
+      length_vs_default:                # PROMOTED 2026-06-12 — a real digestibility signal from data
+        rule: "first-answer length should be at or below the default's answer length for the same question (not 3-5x it)"
+        measured: "current tesser ran 9.6k (pyyaml) / 21.6k-29k (private-repo) chars vs the default's 3.0-5.8k."
+        deterministic: true
+      answer_leads:
+        rule: "the direct answer to the asked question appears first, not buried under method/caveats or process narration ('Self-update done', 'Log opened', 'Pinned at <sha>', 'Found a local digest')"
+        deterministic: true
+      provisional_marker_hygiene:
+        rule: "borrowed verbatim from gs-structure-skill-test structure.test.ts — provisional/superseding markers well-formed and not leaked as human noise"
+        deterministic: true
+    deterministic: true
+
+win_condition:
+  per_cell: "tesser >= default on all three axes AND strictly better on at least one AND cold TTFA not worse than default (hard gate)"
+  goal: "tesser wins across the full dependency x question matrix, including simple deps"
+
+harness:
+  reuse_from: "gs-structure-skill-test"
+  mechanism: "runSkillTurns(prompts[]) — one persisted session via --session-id (turn 0) + --resume (later turns); deterministic structure pins run free under `bun test`; the agent-judged tail of the CALIBRATED axis (B's faithfulness) gated (RUN_EVAL)"
+  isolation_required:
+    - "spawn default-agent runs with NO tesser skill on the path (the maintainer's tesserts/with | tesserts/without scoped-symlink pattern is the proven minimal rig)"
+    - "--disallowedTools Bash (or write isolation) on headless spawns — the harness once committed 9 junk scratch commits to main because `claude -p` inherited git perms + a global commit instruction"
+    - "freshOutDir() under tmpdir so writes can't touch the tracked tree"
+
+open_decisions:
+  # All three draft opens are now settled:
+  #   ttfa_baseline_rule    — SETTLED 2026-06-12 (folded into faster.baseline_rule)
+  #   noise_ratio_ceiling   — SETTLED 2026-06-12 (replaced by citation_placement + length_vs_default)
+  #   forbidden_lexicon_final — SETTLED 2026-06-12 (D41): the FINAL list is digestible.checks.no_internal_lexicon_leak.forbidden_lexicon
+  #                             above — the grade ladder (run/inspect/docs/truth-grade), provisional, cold run, digest,
+  #                             citable knowledge, kind slug, "the skill", + raw citation markup. The scorer + the SKILL.md
+  #                             sync gate (structure.test.ts) both pin against it. The post-dogfood revision pass remains the
+  #                             one open lever (revision_trigger above), not a per-decision blocker.
+
+references:
+  prior_art:
+    - "gs-structure-skill-test (SKILL.md, structure.test.ts, helpers.ts runSkillTurns)"
+    - "agent-overclaiming RCA (2026-06-05)"
+    - "authority-misattribution"
+    - "testing-agent-skills doctrine"
+    - "CALIBRATED axis (D40) — trust-a-claim-as-much-as-it-deserves (JTBD #1/#2 split, Obligations A/B, the 3-bucket coverage map; locked 2026-06-07)"
+    - "CALIBRATED axis (D40) — formal twin: findings-are-max-entropy-distributions (overstatement = lower entropy than evidence licenses)"
+    - "caught-errors-are-a-biased-sample"
+  source_session: "2026-06-11 evening course-correction + 2026-06-12 plan-eng-review defining this scoreboard"
+  scored_data: "5 cells (pyyaml, coral, kinesis, caffeinate, private-repo) default column + tesser runs where available, scored 2026-06-12; the scored table is not part of this repository"
